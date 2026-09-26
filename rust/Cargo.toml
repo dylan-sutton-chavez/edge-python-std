@@ -1,0 +1,26 @@
+[workspace]
+members = ["*"]
+exclude = ["target"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/dylan-sutton-chavez/edge-python-std"
+
+# The plugin kit comes from the engine repo, pinned to a tag so a build never moves under it.
+[workspace.dependencies]
+wasm-pdk = { git = "https://github.com/dylan-sutton-chavez/edge-python", tag = "v0.6.1" }
+libm = "0.2"
+
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# A compute package, so speed beats the few KB of size.
+[profile.release.package.math]
+opt-level = 3
