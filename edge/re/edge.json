@@ -7,6 +7,6 @@
   "imports": {
     "_re": "./re.wasm",
     "re": "./main.py",
-    "test": "https://cdn.edgepython.com/pkg/test/0.1.0/app.edge"
+    "test": "0.1.0"
   }
 }
