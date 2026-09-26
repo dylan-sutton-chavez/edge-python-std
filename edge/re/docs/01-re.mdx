@@ -1,0 +1,76 @@
+---
+title: re
+description: Regular expressions with backreferences and lookaround.
+---
+
+# re
+
+`re` is `match`, `search`, `fullmatch`, `findall`, `groups`, `span`, `sub` and `compile`. A match comes back as the matched text, or `None` when there is none.
+
+```edge-python
+from re import findall, fullmatch, match, search
+
+print(match(r"\d+", "123abc"))
+print(search(r"\d+", "abc123def"))
+print(fullmatch(r"\d+", "123a"))
+print(findall(r"\d+", "a1 b22 c333"))
+```
+
+```output
+123
+123
+None
+['1', '22', '333']
+```
+
+`groups` returns the captures of the first match, `span` its codepoint start and end, and `sub` expands `\1` and `\g<name>` in the template.
+
+```edge-python
+from re import groups, span, sub
+
+print(groups(r"(\d+)-(\d+)", "x 12-34 y"))
+print(span(r"\d+", "áé123"))
+print(sub(r"(\w+)@(\w+)", r"\2.\1", "user@host"))
+```
+
+```output
+['12', '34']
+[2, 5]
+host.user
+```
+
+`compile` checks the pattern once and hands back an object that carries every operation.
+
+```edge-python
+from re import compile
+
+p = compile(r"(\d+)-(\d+)")
+print(p.fullmatch("12-34"))
+print(p.sub(r"\2.\1", "a 12-34 b"))
+```
+
+```output
+12-34
+a 34.12 b
+```
+
+A bad pattern raises `ValueError`, and a pattern that backtracks without end raises `RuntimeError` instead of hanging.
+
+```edge-python
+from re import search
+
+try:
+    search("(unbalanced", "x")
+except ValueError as e:
+    print("bad pattern:", e)
+
+try:
+    search("(a+)+$", "a" * 40 + "!")
+except RuntimeError as e:
+    print("too slow:", e)
+```
+
+```output
+bad pattern: missing closing parenthesis at position 11
+too slow: catastrophic backtracking: O(n^2) time or worse on this input, simplify nested quantifiers
+```

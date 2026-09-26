@@ -1,0 +1,12 @@
+[package]
+name = "re"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-pdk = { workspace = true }

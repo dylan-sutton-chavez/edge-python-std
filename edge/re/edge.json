@@ -1,0 +1,12 @@
+{
+  "name": "re",
+  "version": "0.1.0",
+  "description": "Regular expressions with backreferences and lookaround.",
+  "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
+  "docs": "./docs",
+  "imports": {
+    "_re": "./re.wasm",
+    "re": "./main.py",
+    "test": "https://cdn.edgepython.com/pkg/test/0.1.0/app.edge"
+  }
+}
