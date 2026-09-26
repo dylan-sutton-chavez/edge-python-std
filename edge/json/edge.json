@@ -4,6 +4,7 @@
   "description": "Encode and decode JSON with Python's hooks and options.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
+  "edge": "0.7.0",
   "imports": {
     "_json": "./json.wasm",
     "json": "./main.py",

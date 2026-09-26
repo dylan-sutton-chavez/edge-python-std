@@ -4,6 +4,7 @@
   "description": "Regular expressions with backreferences and lookaround.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
+  "edge": "0.7.0",
   "imports": {
     "_re": "./re.wasm",
     "re": "./main.py",

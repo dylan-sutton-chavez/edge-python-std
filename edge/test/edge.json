@@ -4,6 +4,7 @@
   "description": "Fixtures, assertions and a runner for Edge Python tests.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
+  "edge": "0.7.0",
   "imports": {
     "test": "./main.py"
   }
