@@ -1,0 +1,82 @@
+---
+title: test
+description: Fixtures, assertions and a runner for Edge Python tests.
+---
+
+# test
+
+`test` is a unit-test harness written in Edge Python. Tests register with decorators, fixtures are injected by keyword, and `run()` reports each test and exits with a code a runner can read.
+
+```edge-python
+from test import fixture, test, raises, run
+
+@fixture
+def user():
+    return {"name": "Ana"}
+
+@test("user has a name", "user")
+def has_a_name(user):
+    assert user["name"] == "Ana"
+
+@test("division by zero raises")
+def divides():
+    with raises(ZeroDivisionError):
+        1 / 0
+
+run()
+```
+
+```output
+pass. user has a name
+pass. division by zero raises
+2 passed, 0 failed
+```
+
+`@fixture` registers a factory under its function's name. Every test that names it gets a fresh one, so no test leaks state into another. `@test(description, *uses)` registers a test and the fixtures it takes.
+
+`raises(exc_type, match=None)` asserts that the block raises `exc_type`, a class or a tuple of classes. With `match` the message must also contain that text, so the right exception raised for the wrong reason still fails.
+
+```edge-python
+from test import test, raises, run
+
+def check(n):
+    if n < 0:
+        raise ValueError("must be positive")
+    return n
+
+@test("rejects negatives")
+def rejects():
+    with raises(ValueError, match="must be positive"):
+        check(-1)
+
+run()
+```
+
+```output
+pass. rejects negatives
+1 passed, 0 failed
+```
+
+`run()` prints a `pass.`, `fail.` or `error.` line per test and a summary, then raises `SystemExit(1)` if anything failed and `SystemExit(0)` otherwise. A failed assertion carries its message.
+
+```edge-python
+from test import test, run
+
+@test("two plus two")
+def adds():
+    assert 2 + 2 == 4
+
+@test("this one fails")
+def fails():
+    assert "a" in "zzz", "letter missing"
+
+run()
+```
+
+```output
+pass. two plus two
+fail. this one fails (AssertionError: letter missing)
+1 passed, 1 failed
+```
+
+`edge test` finds every `*_test.py` file and reads each verdict from that exit code.
