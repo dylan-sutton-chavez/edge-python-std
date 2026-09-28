@@ -1,6 +1,6 @@
 name: CI / CD
 
-# Every push tests each package natively and in a browser, and a v tag publishes each one right after its tests.
+# Every push builds the plugins and tests each package, and a v tag then publishes them.
 
 on:
   push:
@@ -16,11 +16,9 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
 
 jobs:
-  packages:
-    name: Packages
+  plugins:
+    name: Plugins
     runs-on: ubuntu-26.04
-    # A tag waits here for a reviewer, since the run publishes what it tests.
-    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -32,6 +30,27 @@ jobs:
         with:
           workspaces: rust
 
+      - name: Build and test
+        run: make wasm && cargo test --manifest-path rust/Cargo.toml
+
+      # Built once, so the packages are tested and published with the same plugins.
+      - uses: actions/upload-artifact@v7
+        with:
+          name: plugins
+          path: edge/*/*.wasm
+
+  packages:
+    name: Packages
+    needs: [plugins]
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: plugins
+          path: edge
+
       # The runner image is not a contract, so the browser --web drives is installed.
       - uses: browser-actions/setup-chrome@v2
         id: chrome
@@ -42,15 +61,42 @@ jobs:
           curl -fsSL https://cdn.edgepython.com/cli/install.sh | sh
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
-      - name: Build and test the plugins
-        run: make wasm && cargo test --manifest-path rust/Cargo.toml
-
-      # tsort lays each package after the std packages it imports, so a dependency is published before what needs it.
-      - name: Test each package, and publish it on a tag
+      - name: Test each package natively and in a browser
         env:
           EDGE_CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+        run: |
+          for dir in edge/*/; do
+            cd "$dir"
+            edge lock
+            edge test
+            edge test --web
+            cd "$GITHUB_WORKSPACE"
+          done
+
+  publish:
+    name: Publish
+    needs: [packages]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-26.04
+    # A reviewer approves here, once every package has passed its tests.
+    environment: production
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          name: plugins
+          path: edge
+
+      - name: Install edge
+        run: |
+          curl -fsSL https://cdn.edgepython.com/cli/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      # tsort lays each package after the std packages it imports, so a dependency is published before what needs it.
+      - name: Publish each package
+        env:
           EDGE_TOKEN: ${{ secrets.EDGE_TOKEN }}
-          RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
         run: |
           order=$(for dir in edge/*/; do
             pkg=$(basename "$dir")
@@ -61,12 +107,8 @@ jobs:
             [ -d "edge/$pkg" ] || continue
             cd "edge/$pkg"
             edge lock
-            edge test
-            edge test --web
-            if [ "$RELEASE" = true ]; then
-              edge build
-              # 2 is a version already published, so the packages after it still go.
-              edge publish app.edge || [ $? -eq 2 ]
-            fi
+            edge build
+            # 2 is a version already published, so the packages after it still go.
+            edge publish app.edge || [ $? -eq 2 ]
             cd "$GITHUB_WORKSPACE"
           done
