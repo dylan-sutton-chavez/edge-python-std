@@ -39,16 +39,21 @@ impl<'a> Matcher<'a> {
 
     /* Leftmost search from the beginning. */
     pub fn search(&self, root: &Node, ngroups: usize) -> Option<Caps> {
-        self.search_from(root, ngroups, 0)
+        self.search_from(root, ngroups, 0, false)
     }
 
-    /* Leftmost search starting no earlier than `from`. */
-    pub fn search_from(&self, root: &Node, ngroups: usize, from: usize) -> Option<Caps> {
+    /* Leftmost search starting no earlier than `from`, where `must_advance` refuses an empty match at `from`. */
+    pub fn search_from(&self, root: &Node, ngroups: usize, from: usize, must_advance: bool) -> Option<Caps> {
         for start in from..=self.input.len() {
             if self.exceeded() { break; } // stop scanning once the budget is gone
             let mut caps: Caps = empty_caps(ngroups);
             let mut found: Option<usize> = None;
-            self.m(root, start, &mut caps, &mut |end, _| { found = Some(end); true });
+            self.m(root, start, &mut caps, &mut |end, _| {
+                // An empty match where the last one ended would repeat it, so the matcher backtracks instead.
+                if must_advance && start == from && end == start { return false; }
+                found = Some(end);
+                true
+            });
             if let Some(end) = found {
                 caps[0] = Some((start, end));
                 return Some(caps);

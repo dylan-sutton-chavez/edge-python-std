@@ -10,13 +10,13 @@ pub mod engine;
 pub mod matcher;
 pub mod parser;
 
-/* Class exports follow the `__class_<Name>_<method>` ABI convention, not snake case. */
-#[allow(non_snake_case)]
+/* The plugin hands back spans, and main.py builds the Match and Pattern objects over them. */
 mod wasm_api {
     use alloc::string::String;
     use alloc::vec::Vec;
     use wasm_pdk::*;
-    use crate::engine::{self, Found, Mode, ReError};
+    use crate::engine::{self, Mode, ReError};
+    use crate::matcher::Caps;
 
     /* Routes engine errors to the matching host exception kind. */
     fn to_error(e: ReError) -> Error {
@@ -47,156 +47,42 @@ mod wasm_api {
         f(&cache[idx].1)
     }
 
-    /* Shared op bodies, module functions and Pattern methods delegate here. */
-    fn do_find(pattern: &str, string: &str, mode: Mode) -> Result<Option<String>> {
-        with_compiled(pattern, |re| Ok(rx(engine::find_rx(re, string, mode))?.map(|f| f.text)))
+    /* Every group's start and end in codepoints, -1 for a group that took no part. */
+    fn spans(caps: &Caps) -> Vec<Value> {
+        caps.iter().flat_map(|g| {
+            let (s, e) = g.map_or((-1, -1), |(s, e)| (s as i128, e as i128));
+            [Value::Int(s), Value::Int(e)]
+        }).collect()
     }
 
-    fn do_findall(pattern: &str, string: &str) -> Result<Vec<Value>> {
-        with_compiled(pattern, |re| {
-            let (founds, ngroups) = rx(engine::find_all_rx(re, string))?;
-            if ngroups <= 1 {
-                return Ok(founds.iter().map(|f| Value::Bytes(pick(f, ngroups).into_bytes())).collect());
-            }
-            Ok(founds.iter().map(|f| Value::List(
-                f.groups.iter().map(|g| Value::Bytes(g.clone().unwrap_or_default().into_bytes())).collect(),
-            )).collect())
+    /* The group count and each named group's index, what a compiled pattern reports. */
+    #[plugin_fn]
+    fn info(pattern: String) -> Result<Vec<Value>> {
+        with_compiled(&pattern, |re| {
+            let names = re.names().iter().map(|(name, at)| (Value::Bytes(name.clone().into_bytes()), Value::Int(*at as i128))).collect();
+            Ok(alloc::vec![Value::Int(re.group_count() as i128), Value::Dict(names)])
         })
     }
 
-    fn do_groups(pattern: &str, string: &str) -> Result<Option<Vec<Value>>> {
-        with_compiled(pattern, |re| {
-            let Some(f) = rx(engine::find_rx(re, string, Mode::Search))? else { return Ok(None); };
-            Ok(Some(f.groups.iter().map(|g| match g {
-                Some(s) => Value::Bytes(s.clone().into_bytes()),
-                None => Value::None,
-            }).collect()))
+    /* The first match as its spans, mode 0 searches, 1 anchors at the start, 2 takes it all. */
+    #[plugin_fn]
+    fn find(pattern: String, string: String, mode: i64) -> Result<Option<Vec<Value>>> {
+        let mode = match mode { 1 => Mode::Match, 2 => Mode::Full, _ => Mode::Search };
+        with_compiled(&pattern, |re| Ok(rx(engine::find_rx(re, &string, mode))?.map(|caps| spans(&caps))))
+    }
+
+    /* Every match as its spans, at most `limit` unless it is zero, in one crossing. */
+    #[plugin_fn]
+    fn find_all(pattern: String, string: String, limit: i64) -> Result<Vec<Value>> {
+        with_compiled(&pattern, |re| Ok(rx(engine::find_all_rx(re, &string, limit.max(0) as usize))?.iter().map(|caps| Value::List(spans(caps))).collect()))
+    }
+
+    /* A template replacing up to `count` matches, the new text and how many it replaced. */
+    #[plugin_fn]
+    fn sub(pattern: String, repl: String, string: String, count: i64) -> Result<Vec<Value>> {
+        with_compiled(&pattern, |re| {
+            let (text, n) = rx(engine::sub_rx(re, &repl, &string, count.max(0) as usize))?;
+            Ok(alloc::vec![Value::Bytes(text.into_bytes()), Value::Int(n as i128)])
         })
-    }
-
-    fn do_span(pattern: &str, string: &str) -> Result<Option<Vec<Value>>> {
-        with_compiled(pattern, |re| {
-            let Some(f) = rx(engine::find_rx(re, string, Mode::Search))? else { return Ok(None); };
-            Ok(Some(alloc::vec![Value::Int(f.start as i128), Value::Int(f.end as i128)]))
-        })
-    }
-
-    fn do_sub(pattern: &str, repl: &str, string: &str) -> Result<String> {
-        with_compiled(pattern, |re| rx(engine::sub_rx(re, repl, string)))
-    }
-
-    /* search finds the leftmost match anywhere, returns group 0 or None. */
-    #[plugin_fn]
-    fn search(pattern: String, string: String) -> Result<Option<String>> {
-        do_find(&pattern, &string, Mode::Search)
-    }
-
-    /* fullmatch requires the pattern to consume the whole string. */
-    #[plugin_fn]
-    fn fullmatch(pattern: String, string: String) -> Result<Option<String>> {
-        do_find(&pattern, &string, Mode::Full)
-    }
-
-    /* findall returns a list of matches shaped like Python, one boundary crossing per call via LIST transit. */
-    #[plugin_fn]
-    fn findall(pattern: String, string: String) -> Result<Vec<Value>> {
-        do_findall(&pattern, &string)
-    }
-
-    /* groups returns the capture groups of the first match, or None. */
-    #[plugin_fn]
-    fn groups(pattern: String, string: String) -> Result<Option<Vec<Value>>> {
-        do_groups(&pattern, &string)
-    }
-
-    /* span returns the codepoint start and end of the first match as a two element list. */
-    #[plugin_fn]
-    fn span(pattern: String, string: String) -> Result<Option<Vec<Value>>> {
-        do_span(&pattern, &string)
-    }
-
-    /* sub replaces every match, expanding backreferences in the template. */
-    #[plugin_fn]
-    fn sub(pattern: String, repl: String, string: String) -> Result<String> {
-        do_sub(&pattern, &repl, &string)
-    }
-
-    fn pick(f: &Found, ngroups: usize) -> String {
-        if ngroups == 1 { f.groups[0].clone().unwrap_or_default() } else { f.text.clone() }
-    }
-
-    /* `re.compile(p)` is a native class named `compile`, instances carry the pattern and the cache holds the program. */
-    #[plugin_fn]
-    fn __class_compile___init__(self_h: Handle, pattern: String) -> Result<()> {
-        // Bad patterns raise here, at compile time, like Python.
-        with_compiled(&pattern, |_| Ok(()))?;
-        let ph = IntoValue::into_handle(pattern)?;
-        self_h.set_attr("pattern", &ph)
-    }
-
-    fn self_pattern(self_h: &Handle) -> Result<String> {
-        let h = self_h.get_attr("pattern")?;
-        String::from_handle(h.raw())
-    }
-
-    #[plugin_fn]
-    fn __class_compile_match(self_h: Handle, string: String) -> Result<Option<String>> {
-        do_find(&self_pattern(&self_h)?, &string, Mode::Match)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_search(self_h: Handle, string: String) -> Result<Option<String>> {
-        do_find(&self_pattern(&self_h)?, &string, Mode::Search)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_fullmatch(self_h: Handle, string: String) -> Result<Option<String>> {
-        do_find(&self_pattern(&self_h)?, &string, Mode::Full)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_findall(self_h: Handle, string: String) -> Result<Vec<Value>> {
-        do_findall(&self_pattern(&self_h)?, &string)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_groups(self_h: Handle, string: String) -> Result<Option<Vec<Value>>> {
-        do_groups(&self_pattern(&self_h)?, &string)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_span(self_h: Handle, string: String) -> Result<Option<Vec<Value>>> {
-        do_span(&self_pattern(&self_h)?, &string)
-    }
-
-    #[plugin_fn]
-    fn __class_compile_sub(self_h: Handle, repl: String, string: String) -> Result<String> {
-        do_sub(&self_pattern(&self_h)?, &repl, &string)
-    }
-
-    /* match is anchored at the start. Hand written export since `match` is a keyword. */
-    #[unsafe(no_mangle)]
-    #[allow(clippy::not_unsafe_ptr_arg_deref)]
-    pub extern "C" fn r#match(argv: *const u32, argc: u32, out: *mut u32) -> i32 {
-        if argc != 3 {
-            __internals::stash_error(Error::Type(alloc::format!("match expects 2 positional args, got {}", argc - 1)));
-            return 1;
-        }
-        let pattern = match String::from_handle(unsafe { *argv.add(0) }) {
-            Ok(v) => v,
-            Err(e) => { __internals::stash_error(e); return 1; }
-        };
-        let string = match String::from_handle(unsafe { *argv.add(1) }) {
-            Ok(v) => v,
-            Err(e) => { __internals::stash_error(e); return 1; }
-        };
-        let value = match do_find(&pattern, &string, Mode::Match) {
-            Ok(v) => v,
-            Err(e) => { __internals::stash_error(e); return 1; }
-        };
-        match IntoValue::into_handle(value) {
-            Ok(h) => { unsafe { *out = h.into_raw(); } 0 }
-            Err(e) => { __internals::stash_error(e); 1 }
-        }
     }
 }

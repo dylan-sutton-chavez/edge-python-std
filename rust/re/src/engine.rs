@@ -16,14 +16,6 @@ pub enum ReError {
     TooComplex(String), // backtracking blew its budget, surfaces as RuntimeError
 }
 
-/* A resolved match, offsets are codepoint indices. */
-pub struct Found {
-    pub start: usize,
-    pub end: usize,
-    pub text: String,
-    pub groups: Vec<Option<String>>,
-}
-
 pub struct Regex {
     prog: Program,
 }
@@ -36,10 +28,13 @@ impl Regex {
     }
 
     pub fn group_count(&self) -> usize { self.prog.group_count }
+
+    // Each named group with its index, in the order the pattern opens them.
+    pub fn names(&self) -> &[(String, usize)] { &self.prog.names }
 }
 
-/* Single match in the requested mode, over an already-compiled regex. */
-pub fn find_rx(re: &Regex, text: &str, mode: Mode) -> Result<Option<Found>, ReError> {
+/* Single match in the requested mode, its capture spans in codepoints. */
+pub fn find_rx(re: &Regex, text: &str, mode: Mode) -> Result<Option<Caps>, ReError> {
     let chars: Vec<char> = text.chars().collect();
     let m = Matcher::new(&chars, re.prog.flags);
     let caps = match mode {
@@ -48,71 +43,49 @@ pub fn find_rx(re: &Regex, text: &str, mode: Mode) -> Result<Option<Found>, ReEr
         Mode::Full => m.match_at(&re.prog.root, re.prog.group_count, true),
     };
     match caps {
-        Some(c) => Ok(Some(build(&chars, &c, re.prog.group_count))),
         None if m.exceeded() => Err(too_complex()),
-        None => Ok(None),
+        found => Ok(found),
     }
 }
 
-/* All non overlapping matches over a compiled regex, plus the group count for output shaping. */
-pub fn find_all_rx(re: &Regex, text: &str) -> Result<(Vec<Found>, usize), ReError> {
+/* Every match left to right, at most `limit` unless it is zero, as its capture spans. */
+pub fn find_all_rx(re: &Regex, text: &str, limit: usize) -> Result<Vec<Caps>, ReError> {
     let chars: Vec<char> = text.chars().collect();
-    let m = Matcher::new(&chars, re.prog.flags);
+    all(re, &chars, limit)
+}
+
+/* The walk findall, finditer, sub and split share, the next search starts where a match ended. */
+fn all(re: &Regex, chars: &[char], limit: usize) -> Result<Vec<Caps>, ReError> {
+    let m = Matcher::new(chars, re.prog.flags);
     let mut out = Vec::new();
-    let mut start = 0;
-    while start <= chars.len() {
-        match m.search_from(&re.prog.root, re.prog.group_count, start) {
-            Some(c) => {
-                let (s, e) = c[0].unwrap();
-                out.push(build(&chars, &c, re.prog.group_count));
-                start = if e > s { e } else { e + 1 }; // step past an empty match
-            }
-            None => {
-                if m.exceeded() { return Err(too_complex()); }
-                break;
-            }
-        }
-    }
-    Ok((out, re.prog.group_count))
-}
-
-/* Replace every match over a compiled regex, expanding backreferences in the template. */
-pub fn sub_rx(re: &Regex, repl: &str, text: &str) -> Result<String, ReError> {
-    let chars: Vec<char> = text.chars().collect();
-    let repl_chars: Vec<char> = repl.chars().collect();
-    let m = Matcher::new(&chars, re.prog.flags);
-    let mut out = String::new();
-    let mut last = 0;
-    let mut start = 0;
-    while start <= chars.len() {
-        let Some(c) = m.search_from(&re.prog.root, re.prog.group_count, start) else {
+    let (mut start, mut empty) = (0, false);
+    while start <= chars.len() && (limit == 0 || out.len() < limit) {
+        let Some(c) = m.search_from(&re.prog.root, re.prog.group_count, start, empty) else {
             if m.exceeded() { return Err(too_complex()); }
             break;
         };
         let (s, e) = c[0].unwrap();
-        for ch in &chars[last..s] { out.push(*ch); }
-        expand(&repl_chars, &chars, &c, &re.prog.names, &mut out)?;
-        if e > s {
-            last = e;
-            start = e;
-        } else {
-            if e < chars.len() { out.push(chars[e]); }
-            last = e + 1;
-            start = e + 1;
-        }
+        (start, empty) = (e, s == e);
+        out.push(c);
     }
-    for ch in &chars[last.min(chars.len())..] { out.push(*ch); }
     Ok(out)
 }
 
-fn build(chars: &[char], caps: &Caps, ngroups: usize) -> Found {
-    let (s, e) = caps[0].unwrap();
-    let text: String = chars[s..e].iter().collect();
-    let mut groups = Vec::with_capacity(ngroups);
-    for i in 1..=ngroups {
-        groups.push(caps.get(i).copied().flatten().map(|(a, b)| chars[a..b].iter().collect()));
+/* Replace up to `count` matches, every one when it is zero, and say how many it replaced. */
+pub fn sub_rx(re: &Regex, repl: &str, text: &str, count: usize) -> Result<(String, usize), ReError> {
+    let chars: Vec<char> = text.chars().collect();
+    let repl_chars: Vec<char> = repl.chars().collect();
+    let found = all(re, &chars, count)?;
+    let mut out = String::new();
+    let mut last = 0;
+    for caps in &found {
+        let (s, e) = caps[0].unwrap();
+        out.extend(&chars[last..s]);
+        expand(&repl_chars, &chars, caps, &re.prog.names, &mut out)?;
+        last = e;
     }
-    Found { start: s, end: e, text, groups }
+    out.extend(&chars[last..]);
+    Ok((out, found.len()))
 }
 
 /* Expand a replacement template against the captured groups. */
@@ -182,5 +155,28 @@ fn validate(node: &Node) -> Result<(), ReError> {
         Node::Concat(v) | Node::Alt(v) => { for n in v { validate(n)?; } Ok(()) }
         Node::Group { node, .. } | Node::NonCap(node) | Node::Repeat { node, .. } => validate(node),
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spans(pattern: &str, text: &str) -> Vec<(usize, usize)> {
+        find_all_rx(&Regex::compile(pattern).unwrap(), text, 0).unwrap().iter().map(|c| c[0].unwrap()).collect()
+    }
+
+    // After an empty match the next one may start there only if it is not empty, as in Python.
+    #[test]
+    fn an_empty_match_never_repeats_where_it_ended() {
+        assert_eq!(spans(r"\b|a", "a"), [(0, 0), (0, 1), (1, 1)]);
+        assert_eq!(spans("x*", "axb"), [(0, 0), (1, 2), (2, 2), (3, 3)]);
+    }
+
+    #[test]
+    fn sub_replaces_up_to_its_count_and_says_how_many() {
+        let re = Regex::compile(r"(\d)").unwrap();
+        assert_eq!(sub_rx(&re, r"<\1>", "a1b2c3", 2).unwrap(), (String::from("a<1>b<2>c3"), 2));
+        assert_eq!(sub_rx(&Regex::compile("x*").unwrap(), "-", "abxd", 0).unwrap(), (String::from("-a-b--d-"), 5));
     }
 }
