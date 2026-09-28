@@ -2,3 +2,4 @@ target/
 Cargo.lock
 *.edge
 *.wasm
+.DS_STORE
