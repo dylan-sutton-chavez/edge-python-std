@@ -1,13 +1,7 @@
-from _struct import calcsize as _calcsize, pack as _pack, unpack as _unpack
+from _struct import calcsize, pack, unpack as _unpack
 
 # A bad format or value raises ValueError, the one exception class a program can catch it as.
 error = ValueError
-
-def calcsize(format):
-    return _calcsize(format)
-
-def pack(format, *values):
-    return _pack(format, *values)
 
 def unpack(format, buffer):
     return tuple(_unpack(format, buffer))

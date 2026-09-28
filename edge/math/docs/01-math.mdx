@@ -1,0 +1,71 @@
+---
+title: math
+description: Python's math functions, exact where Python is exact.
+---
+
+# math
+
+`math` works like Python's. It holds the constants, the float functions, the integer functions and the exact sums, and `fsum`, `hypot` and `dist` give Python's results to the last bit.
+
+```edge-python
+import math
+
+print(math.sqrt(2), math.pi)
+print(math.hypot(3, 4, 12), math.dist((0, 0), (3, 4)))
+print(math.floor(2.7), math.ceil(2.1), math.trunc(-2.7))
+```
+
+```output
+1.4142135623730951 3.141592653589793
+13.0 5.0
+2 3 -2
+```
+
+The integer functions take ints and stay exact, and `prod` keeps a product of ints an int.
+
+```edge-python
+import math
+
+print(math.factorial(20), math.comb(10, 3), math.perm(5, 2))
+print(math.gcd(12, 18, 24), math.lcm(4, 6), math.isqrt(99))
+print(math.prod([1, 2, 3, 4]), math.prod([0.5, 4]))
+```
+
+```output
+2432902008176640000 120 20
+6 12 9
+24 2.0
+```
+
+`fsum` adds exactly and rounds once, `isclose` compares within a tolerance, and `modf` and `frexp` split a float into a tuple.
+
+```edge-python
+import math
+
+print(0.1 + 0.2 + 0.3, math.fsum([0.1, 0.2, 0.3]))
+print(math.isclose(0.1 + 0.2, 0.3), math.isclose(1.0, 1.001, rel_tol=0.01))
+print(math.modf(3.75), math.frexp(12.0))
+```
+
+```output
+0.6000000000000001 0.6
+True True
+(0.75, 3.0) (0.75, 4)
+```
+
+A value outside a function's domain raises `ValueError`, and a result too large for a float raises `OverflowError`. Ints hold 128 bits in Edge, so an integer result past that, such as `factorial(34)`, raises `OverflowError` too. `nextafter`, `ulp` and `sumprod` are not supported.
+
+```edge-python
+import math
+
+for f, x in [(math.sqrt, -1), (math.exp, 1000)]:
+    try:
+        f(x)
+    except (ValueError, OverflowError) as e:
+        print(type(e).__name__, e)
+```
+
+```output
+ValueError math domain error
+OverflowError math range error
+```

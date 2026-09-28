@@ -1,0 +1,13 @@
+{
+  "name": "math",
+  "version": "0.1.0",
+  "description": "Python's math functions, exact where Python is exact.",
+  "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
+  "docs": "./docs",
+  "edge": "0.7.0",
+  "imports": {
+    "_math": "./math.wasm",
+    "math": "./main.py",
+    "test": "0.1.0"
+  }
+}

@@ -4,7 +4,7 @@
   "description": "Pack and unpack binary data in Python's formats.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
-  "edge": "0.7.0",
+  "edge": "0.7.2",
   "imports": {
     "_struct": "./struct.wasm",
     "struct": "./main.py",
