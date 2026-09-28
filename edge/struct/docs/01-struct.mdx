@@ -1,0 +1,76 @@
+---
+title: struct
+description: Pack and unpack binary data in Python's formats.
+---
+
+# struct
+
+`struct` works like Python's. `pack` turns values into `bytes` by a format, `unpack` turns them back into a tuple, and `calcsize` says how many bytes a format takes.
+
+```edge-python
+import struct
+
+data = struct.pack("<hif", 1, -2, 0.5)
+print(data)
+print(struct.unpack("<hif", data))
+print(struct.calcsize("<hif"))
+```
+
+```output
+b'\x01\x00\xfe\xff\xff\xff\x00\x00\x00?'
+(1, -2, 0.5)
+10
+```
+
+A format starts with its byte order. `<` and `>` pick little and big endian with standard sizes, and a format with no prefix lays its items out the way C does, each aligned to its size.
+
+```edge-python
+import struct
+
+print(struct.pack(">H", 258), struct.pack("<H", 258))
+print(struct.calcsize("bi"), struct.calcsize("<bi"))
+```
+
+```output
+b'\x01\x02' b'\x02\x01'
+8 5
+```
+
+`s` is a run of bytes padded or cut to its count, `c` one byte and `?` a bool. A `Struct` keeps a format, `unpack_from` reads at an offset and `iter_unpack` walks a buffer of records.
+
+```edge-python
+import struct
+
+record = struct.Struct("<4sH?")
+data = record.pack(b"edge", 7, True) + record.pack(b"py", 8, False)
+print(record.size, record.unpack_from(data, record.size))
+for name, n, ok in record.iter_unpack(data):
+    print(name, n, ok)
+```
+
+```output
+7 (b'py\x00\x00', 8, False)
+b'edge' 7 True
+b'py\x00\x00' 8 False
+```
+
+A value out of range or of the wrong kind raises `struct.error`, which is `ValueError` here, and a float too large for its code raises `OverflowError`. `pack_into` is not supported, since there is no writable buffer to pack into.
+
+```edge-python
+import struct
+
+try:
+    struct.pack("B", 300)
+except struct.error as e:
+    print("out of range:", e)
+
+try:
+    struct.pack("<e", 70000.0)
+except OverflowError as e:
+    print("too large:", e)
+```
+
+```output
+out of range: 'B' format requires 0 <= number <= 255
+too large: float too large to pack with e format
+```

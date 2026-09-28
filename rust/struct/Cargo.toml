@@ -1,0 +1,15 @@
+[package]
+name = "struct"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+# struct is a Rust keyword, so the library takes another name and make wasm renames its artifact.
+[lib]
+name = "edge_struct"
+crate-type = ["cdylib"]
+
+[dependencies]
+wasm-pdk = { workspace = true }
+libm = { workspace = true }
