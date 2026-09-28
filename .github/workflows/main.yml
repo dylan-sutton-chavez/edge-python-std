@@ -1,0 +1,72 @@
+name: CI / CD
+
+# Every push tests each package natively and in a browser, and a v tag publishes each one right after its tests.
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+
+jobs:
+  packages:
+    name: Packages
+    runs-on: ubuntu-26.04
+    # A tag waits here for a reviewer, since the run publishes what it tests.
+    environment: ${{ startsWith(github.ref, 'refs/tags/v') && 'production' || '' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: rust
+
+      # The runner image is not a contract, so the browser --web drives is installed.
+      - uses: browser-actions/setup-chrome@v2
+        id: chrome
+
+      # Always the newest CLI, since a package is only as current as the engine it is tested on.
+      - name: Install edge
+        run: |
+          curl -fsSL https://cdn.edgepython.com/cli/install.sh | sh
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Build and test the plugins
+        run: make wasm && cargo test --manifest-path rust/Cargo.toml
+
+      # tsort lays each package after the std packages it imports, so a dependency is published before what needs it.
+      - name: Test each package, and publish it on a tag
+        env:
+          EDGE_CHROME_PATH: ${{ steps.chrome.outputs.chrome-path }}
+          EDGE_TOKEN: ${{ secrets.EDGE_TOKEN }}
+          RELEASE: ${{ startsWith(github.ref, 'refs/tags/v') }}
+        run: |
+          order=$(for dir in edge/*/; do
+            pkg=$(basename "$dir")
+            echo "$pkg $pkg"
+            jq -r --arg pkg "$pkg" '.imports | to_entries[] | select(.value | test("^[0-9]")) | "\(.key) \($pkg)"' "$dir/edge.json"
+          done | tsort)
+          for pkg in $order; do
+            [ -d "edge/$pkg" ] || continue
+            cd "edge/$pkg"
+            edge lock
+            edge test
+            edge test --web
+            if [ "$RELEASE" = true ]; then
+              edge build
+              # 2 is a version already published, so the packages after it still go.
+              edge publish app.edge || [ $? -eq 2 ]
+            fi
+            cd "$GITHUB_WORKSPACE"
+          done

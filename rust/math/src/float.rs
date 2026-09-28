@@ -2,7 +2,7 @@ use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
 use wasm_pdk::*;
-use crate::{domain, not_real, raise, too_large, Integer, Real};
+use crate::{domain, not_real, raise, Integer, Real};
 
 // A NaN out of a number leaves the domain, an infinity out of a finite one overflows or hits a pole.
 fn checked(x: f64, r: f64, overflows: bool) -> Result<f64> {
@@ -108,34 +108,24 @@ fn modf(x: Real) -> Result<Handle> {
     pair(Value::Float(fraction), Value::Float(whole))
 }
 
-// An int comes back as it is, and a float rounds to the int it names.
-fn integral(x: Handle, round: fn(f64) -> f64) -> Result<i128> {
-    let r = match decode(x.raw()) {
-        Ok(Value::Int(i)) => return Ok(i),
-        Ok(Value::Bool(b)) => return Ok(b as i128),
-        Ok(Value::Float(f)) => round(f),
-        _ => return Err(not_real(x.raw())),
-    };
-    if r.is_nan() {
-        return Err(Error::Value(String::from("cannot convert float NaN to integer")));
+// An int comes back as it is and a float rounds, and main.py turns either into an int the way int() does.
+fn integral(x: Handle, round: fn(f64) -> f64) -> Result<Value> {
+    match decode(x.raw()) {
+        Ok(Value::Int(i)) => Ok(Value::Int(i)),
+        Ok(Value::Bool(b)) => Ok(Value::Int(b as i128)),
+        Ok(Value::Float(f)) => Ok(Value::Float(round(f))),
+        _ => Err(not_real(x.raw())),
     }
-    if r.is_infinite() {
-        return Err(raise("OverflowError", "cannot convert float infinity to integer"));
-    }
-    if r < i128::MIN as f64 || r >= -(i128::MIN as f64) {
-        return Err(too_large());
-    }
-    Ok(r as i128)
 }
 
 #[plugin_fn]
-fn floor(x: Handle) -> Result<i128> { integral(x, libm::floor) }
+fn floor(x: Handle) -> Result<Value> { integral(x, libm::floor) }
 
 #[plugin_fn]
-fn ceil(x: Handle) -> Result<i128> { integral(x, libm::ceil) }
+fn ceil(x: Handle) -> Result<Value> { integral(x, libm::ceil) }
 
 #[plugin_fn]
-fn trunc(x: Handle) -> Result<i128> { integral(x, libm::trunc) }
+fn trunc(x: Handle) -> Result<Value> { integral(x, libm::trunc) }
 
 #[plugin_fn]
 fn isfinite(x: Real) -> bool { x.0.is_finite() }

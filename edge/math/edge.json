@@ -4,7 +4,7 @@
   "description": "Python's math functions, exact where Python is exact.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
-  "edge": "0.7.0",
+  "edge": "0.7.3",
   "imports": {
     "_math": "./math.wasm",
     "math": "./main.py",

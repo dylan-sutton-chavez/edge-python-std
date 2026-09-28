@@ -17,7 +17,7 @@ print(dumps({"k": [1, 2, 3], "ok": True}))
 
 ```output
 ada
-{"k":[1,2,3],"ok":true}
+{"k": [1, 2, 3], "ok": true}
 ```
 
 `indent` and `sort_keys` shape the output.
@@ -55,7 +55,7 @@ True
 3.0
 ```
 
-A parse failure raises `ValueError`, nesting past 1000 levels raises `RuntimeError`, and a value with no JSON form raises `TypeError` unless `default` turns it into one.
+A parse failure raises `json.JSONDecodeError`, which is `ValueError` here, nesting past 1000 levels raises `RuntimeError`, and a value with no JSON form raises `TypeError` unless `default` turns it into one.
 
 ```edge-python
 from json import dumps, loads
@@ -75,6 +75,6 @@ except TypeError as e:
 ```
 
 ```output
-parse failed: unknown literal at byte 1
-dump failed: 'function' is not JSON-serializable
+parse failed: Expecting property name enclosed in double quotes: line 1 column 2 (char 1)
+dump failed: Object of type function is not JSON serializable
 ```

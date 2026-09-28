@@ -11,7 +11,7 @@ repository = "https://github.com/dylan-sutton-chavez/edge-python-std"
 
 # The plugin kit comes from the engine repo, pinned to a tag so a build never moves under it.
 [workspace.dependencies]
-wasm-pdk = { git = "https://github.com/dylan-sutton-chavez/edge-python", tag = "v0.6.1" }
+wasm-pdk = { git = "https://github.com/dylan-sutton-chavez/edge-python", tag = "v0.7.3" }
 libm = "0.2"
 
 [profile.release]

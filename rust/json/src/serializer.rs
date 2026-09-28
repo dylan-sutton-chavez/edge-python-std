@@ -1,9 +1,10 @@
-use alloc::{borrow::ToOwned, format, string::String, vec::Vec};
+use alloc::{borrow::ToOwned, format, string::{String, ToString}, vec::Vec};
+use core::cmp::Ordering;
 use wasm_pdk::{Error, FromValue, Handle, Result, Value, decode, encode};
 
 /// Full Python `json.dumps` kwargs supported.
 pub struct Options {
-    pub indent: Option<i64>,
+    pub indent: Option<String>,
     pub sort_keys: bool,
     pub ensure_ascii: bool,
     pub check_circular: bool,
@@ -20,7 +21,7 @@ impl Default for Options {
         Self {
             indent: None, sort_keys: false, ensure_ascii: true,
             check_circular: true, allow_nan: true, skipkeys: false,
-            item_sep: ",".to_owned(), key_sep: ":".to_owned(),
+            item_sep: ", ".to_owned(), key_sep: ": ".to_owned(),
             cls: None, default: None,
         }
     }
@@ -71,41 +72,21 @@ fn serialize_into(value: &Handle, out: &mut String, ctx: &mut SerCtx, depth: usi
             Ok(())
         }
         "float" => {
-            match decode(value.raw())? {
-                Value::Float(f) => {
-                    if !f.is_finite() {
-                        if !ctx.opts.allow_nan {
-                            return Err(Error::Value("Out of range float values are not JSON compliant".into()));
-                        }
-                        out.push_str(if f.is_nan() { "NaN" } else if f > 0.0 { "Infinity" } else { "-Infinity" });
-                    } else {
-                        out.push_str(&format_float(f));
-                    }
-                }
-                _ => return Err(Error::Type("float decoded as non-float".into())),
-            }
+            out.push_str(&float_text(value, ctx.opts.allow_nan)?);
             Ok(())
         }
         "str" => {
-            match decode(value.raw())? {
-                Value::Bytes(b) => {
-                    let s = String::from_utf8(b).map_err(|e| Error::Value(format!("invalid utf-8 in str: {}", e)))?;
-                    escape_string(&s, out, ctx.opts.ensure_ascii);
-                }
-                _ => return Err(Error::Type("str decoded as non-bytes".into())),
-            }
+            escape_string(&string(value)?, out, ctx.opts.ensure_ascii);
             Ok(())
         }
-        "list" | "tuple" | "set" | "frozenset" => serialize_sequence(value, out, ctx, depth),
+        "list" | "tuple" => serialize_sequence(value, out, ctx, depth),
         "dict" => serialize_object(value, out, ctx, depth),
         other => {
             if let Some(default) = &ctx.opts.default {
                 let replacement = default.call("__call__", &[value.raw()])?;
                 return serialize_into(&replacement, out, ctx, depth);
             }
-            // Native callables type as `builtin_function_or_method`, take the user-function error path.
-            let name = if other == "builtin_function_or_method" { "function" } else { other };
-            Err(Error::Type(format!("'{}' is not JSON-serializable", name)))
+            Err(Error::Type(format!("Object of type {} is not JSON serializable", other)))
         }
     }
 }
@@ -121,15 +102,14 @@ fn serialize_sequence(value: &Handle, out: &mut String, ctx: &mut SerCtx, depth:
         out.push(']');
         return Ok(());
     }
-    let indent_str = ctx.opts.indent.map(|n| " ".repeat(n.max(0) as usize));
+    let opts = ctx.opts;
     for i in 0..n {
-        let idx = encode(Value::Int(i as i128))?;
-        let item = it.get_item(&idx)?;
-        if i > 0 { out.push_str(&ctx.opts.item_sep); }
-        write_indent(out, indent_str.as_deref(), depth + 1);
+        let item = it.get_item(&index(i)?)?;
+        if i > 0 { out.push_str(&opts.item_sep); }
+        write_indent(out, opts.indent.as_deref(), depth + 1);
         serialize_into(&item, out, ctx, depth + 1)?;
     }
-    write_indent(out, indent_str.as_deref(), depth);
+    write_indent(out, opts.indent.as_deref(), depth);
     out.push(']');
     Ok(())
 }
@@ -139,41 +119,92 @@ fn serialize_object(value: &Handle, out: &mut String, ctx: &mut SerCtx, depth: u
         return Err(Error::Value("Circular reference detected".into()));
     }
     out.push('{');
-    let keys = value.iter()?;
-    let n = keys.len()?;
-    if n == 0 {
-        out.push('}');
-        return Ok(());
+    let opts = ctx.opts;
+    let view = value.call("items", &[])?.iter()?;
+    let mut pairs = Vec::new();
+    for i in 0..view.len()? {
+        let pair = view.get_item(&index(i)?)?;
+        pairs.push((pair.get_item(&index(0)?)?, pair.get_item(&index(1)?)?));
     }
-    let mut pairs: Vec<(String, Handle)> = Vec::with_capacity(n as usize);
-    for i in 0..n {
-        let idx = encode(Value::Int(i as i128))?;
-        let key = keys.get_item(&idx)?;
-        let key_ty_handle = key.type_of()?;
-        let key_ty = String::from_handle(key_ty_handle.raw())?;
-        if key_ty != "str" {
-            if ctx.opts.skipkeys { continue; }
-            return Err(Error::Type(format!("keys must be str, not {}", key_ty)));
-        }
-        let key_str = match decode(key.raw())? {
-            Value::Bytes(b) => String::from_utf8(b).map_err(|e| Error::Value(format!("invalid utf-8 in key: {}", e)))?,
-            _ => return Err(Error::Type("str key decoded as non-bytes".into())),
-        };
-        pairs.push((key_str, key));
+    if opts.sort_keys {
+        sort_keys(&mut pairs)?;
     }
-    if ctx.opts.sort_keys { pairs.sort_by(|a, b| a.0.cmp(&b.0)); }
-    let indent_str = ctx.opts.indent.map(|n| " ".repeat(n.max(0) as usize));
-    for (i, (key_str, key)) in pairs.iter().enumerate() {
-        let item = value.get_item(key)?;
-        if i > 0 { out.push_str(&ctx.opts.item_sep); }
-        write_indent(out, indent_str.as_deref(), depth + 1);
-        escape_string(key_str, out, ctx.opts.ensure_ascii);
-        out.push_str(&ctx.opts.key_sep);
-        serialize_into(&item, out, ctx, depth + 1)?;
+    let mut written = 0;
+    for (key, item) in &pairs {
+        let Some(text) = key_text(key, opts)? else { continue };
+        if written > 0 { out.push_str(&opts.item_sep); }
+        written += 1;
+        write_indent(out, opts.indent.as_deref(), depth + 1);
+        escape_string(&text, out, opts.ensure_ascii);
+        out.push_str(&opts.key_sep);
+        serialize_into(item, out, ctx, depth + 1)?;
     }
-    write_indent(out, indent_str.as_deref(), depth);
+    if written > 0 { write_indent(out, opts.indent.as_deref(), depth); }
     out.push('}');
     Ok(())
+}
+
+/* A key as sort_keys ranks it, numbers by value and strings by text. */
+enum Rank { Int(i128), Float(f64), Text(String), Other }
+
+impl Rank {
+    fn of(key: &Handle) -> Rank {
+        match decode(key.raw()) {
+            Ok(Value::Int(n)) => Rank::Int(n),
+            Ok(Value::Bool(b)) => Rank::Int(b as i128),
+            Ok(Value::Float(f)) => Rank::Float(f),
+            Ok(Value::Bytes(s)) => Rank::Text(String::from_utf8(s).unwrap_or_default()),
+            _ => Rank::Other,
+        }
+    }
+
+    fn kind(&self) -> u8 {
+        match self { Rank::Int(_) | Rank::Float(_) => 0, Rank::Text(_) => 1, Rank::Other => 2 }
+    }
+}
+
+// The engine cannot run list.sort for a plugin, so keys rank here as Python ranks them and refuse to as it refuses.
+fn sort_keys(pairs: &mut Vec<(Handle, Handle)>) -> Result<()> {
+    let mut ranked: Vec<(Rank, (Handle, Handle))> = pairs.drain(..).map(|pair| (Rank::of(&pair.0), pair)).collect();
+    if let Some((_, (odd, _))) = ranked.iter().find(|(rank, _)| rank.kind() != ranked[0].0.kind()) {
+        let name = |key: &Handle| key.type_of().and_then(|t| String::from_handle(t.raw()));
+        return Err(Error::Type(format!("'<' not supported between instances of '{}' and '{}'", name(odd)?, name(&ranked[0].1.0)?)));
+    }
+    ranked.sort_by(|(a, _), (b, _)| match (a, b) {
+        (Rank::Int(x), Rank::Int(y)) => x.cmp(y),
+        (Rank::Int(x), Rank::Float(y)) => (*x as f64).partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Rank::Float(x), Rank::Int(y)) => x.partial_cmp(&(*y as f64)).unwrap_or(Ordering::Equal),
+        (Rank::Float(x), Rank::Float(y)) => x.partial_cmp(y).unwrap_or(Ordering::Equal),
+        (Rank::Text(x), Rank::Text(y)) => x.cmp(y),
+        _ => Ordering::Equal,
+    });
+    pairs.extend(ranked.into_iter().map(|(_, pair)| pair));
+    Ok(())
+}
+
+// Python writes a number, a bool or None as the string it reads back as, skips another key under skipkeys and refuses it otherwise.
+fn key_text(key: &Handle, opts: &Options) -> Result<Option<String>> {
+    let ty = String::from_handle(key.type_of()?.raw())?;
+    Ok(Some(match (ty.as_str(), decode(key.raw())) {
+        ("str", _) => string(key)?,
+        ("bool", Ok(Value::Bool(b))) => (if b { "true" } else { "false" }).to_owned(),
+        ("int", Ok(Value::Int(i))) => i.to_string(),
+        ("float", _) => float_text(key, opts.allow_nan)?,
+        ("NoneType", _) => "null".to_owned(),
+        _ if opts.skipkeys => return Ok(None),
+        _ => return Err(Error::Type(format!("keys must be str, int, float, bool or None, not {ty}"))),
+    }))
+}
+
+fn index(i: i64) -> Result<Handle> {
+    encode(Value::Int(i as i128))
+}
+
+fn string(value: &Handle) -> Result<String> {
+    match decode(value.raw())? {
+        Value::Bytes(b) => String::from_utf8(b).map_err(|e| Error::Value(format!("invalid utf-8 in str: {}", e))),
+        _ => Err(Error::Type("str decoded as non-bytes".into())),
+    }
 }
 
 fn write_indent(out: &mut String, unit: Option<&str>, depth: usize) {
@@ -213,14 +244,15 @@ fn escape_string(s: &str, out: &mut String, ensure_ascii: bool) {
     out.push('"');
 }
 
-fn format_float(f: f64) -> String {
-    // Integer-valued floats keep a trailing ".0" to disambiguate from int (Python's `json.dumps(1.0)` -> `"1.0"`).
-    let s = format!("{}", f);
-    if s.contains('.') || s.contains('e') || s.contains('E') || s.contains("inf") || s.contains("NaN") {
-        s
-    } else {
-        let mut t = s;
-        t.push_str(".0");
-        t
+// The engine writes the float, so dumps agrees with print, and only NaN and the infinities take JSON's names.
+fn float_text(value: &Handle, allow_nan: bool) -> Result<String> {
+    let Value::Float(f) = decode(value.raw())? else { return Err(Error::Type("float decoded as non-float".into())) };
+    let text = String::from_handle(encode(Value::Bytes(b"{}".to_vec()))?.call("format", &[value.raw()])?.raw())?;
+    if f.is_finite() {
+        return Ok(text);
     }
+    if !allow_nan {
+        return Err(Error::Value(format!("Out of range float values are not JSON compliant: {text}")));
+    }
+    Ok((if f.is_nan() { "NaN" } else if f > 0.0 { "Infinity" } else { "-Infinity" }).to_owned())
 }

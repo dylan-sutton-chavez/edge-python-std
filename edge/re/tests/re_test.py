@@ -110,11 +110,37 @@ def malformed():
     with raises(re.error):
         re.compile("(")
 
-@test("a bad pattern names what is wrong")
+@test("a bad pattern names what is wrong and where, as Python does")
 def messages():
-    for pattern, message in [("(unbalanced", "missing closing parenthesis"), ("a**", "multiple repeat"), ("(?<=a+)b", "lookbehind requires fixed width"), (r"\1", "invalid group reference"), (r"(a)\2", "invalid group reference"), (r"(\1)", "cannot refer to an open group")]:
+    for pattern, message in [
+        ("(unbalanced", "missing ), unterminated subpattern at position 0"),
+        ("a**", "multiple repeat at position 2"),
+        ("(?<=a+)b", "look-behind requires fixed-width pattern"),
+        (r"(a)\2", "invalid group reference 2 at position 4"),
+        (r"(\1)", "cannot refer to an open group at position 1"),
+        (r"\q", r"bad escape \q at position 0"),
+        ("[z-a]", "bad character range z-a at position 1"),
+        ("a(?i)b", "global flags not at the start of the expression at position 1"),
+    ]:
         with raises(re.error, match=message):
             re.search(pattern, "x")
+    with raises(re.error, match="invalid group reference 9 at position 1"):
+        re.sub("(a)", r"\9", "no match here")
+    with raises(IndexError, match="unknown group name 'x'"):
+        re.sub("a", r"\g<x>", "a")
+
+@test("flags reach only the group that sets them, and verbose, ascii and the anchors read as in Python")
+def flags():
+    assert re.match("(?i:A)b", "ab") and not re.match("(?i:A)b", "aB")
+    assert re.match("a b # c", "ab", re.X) and not re.match(r"(?a)\w", "é")
+    assert re.search(r"a\Z", "a\n") is None and re.search("a$", "a\n")
+    assert re.compile("(?i)a").flags == re.I | re.U and repr(re.compile("a", re.X | re.I)) == "re.compile('a', re.IGNORECASE|re.VERBOSE)"
+
+@test("possessive repeats, atomic groups, conditions and octal escapes read as in Python")
+def extensions():
+    assert re.match("a*+a", "aaa") is None and re.match("(?>a*)b", "aab")
+    assert re.match("(a)?(?(1)b|c)", "ab")[0] == "ab" and re.match("(a)?(?(1)b|c)", "c")[0] == "c"
+    assert re.match(r"\101", "A") and re.sub("a", r"<\g<0>\101>", "a") == "<aA>"
 
 @test("backtracking stops with RuntimeError before it runs away")
 def backtracking():

@@ -14,163 +14,108 @@ pub struct LoadCtx {
 
 const MAX_DEPTH: usize = 1000;
 
-// Recursive-descent parser, composites via `Handle::new_dict`/`new_list`/`set_item`/`list.append`, primitives via `encode`.
+// Recursive-descent parser that reads delimiters the way Python's scanner does, before tokenizing what follows.
 pub fn parse(src: &str, ctx: &LoadCtx) -> Result<Handle> {
     let mut tk = Tokenizer::new(src);
-    let value = parse_value(&mut tk, ctx, 0)?;
-    match tk.next_token().map_err(to_pdk_err)? {
-        Token::Eof => Ok(value),
-        _ => Err(value_err(tk.pos(), "trailing data after JSON value")),
+    if src.starts_with('\u{feff}') {
+        return Err(to_pdk_err(tk.fail("Unexpected UTF-8 BOM (decode using utf-8-sig)", 0)));
     }
+    let value = parse_value(&mut tk, ctx, 0)?;
+    if tk.peek().is_some() {
+        return Err(to_pdk_err(tk.fail("Extra data", tk.pos())));
+    }
+    Ok(value)
 }
 
 fn parse_value(tk: &mut Tokenizer, ctx: &LoadCtx, depth: usize) -> Result<Handle> {
-    let t = tk.next_token().map_err(to_pdk_err)?;
-    parse_value_with(tk, t, ctx, depth)
-}
-
-fn parse_value_with(tk: &mut Tokenizer, t: Token, ctx: &LoadCtx, depth: usize) -> Result<Handle> {
+    let t = tk.value().map_err(to_pdk_err)?;
     match t {
         Token::Null => encode(Value::None),
         Token::True => encode(Value::Bool(true)),
         Token::False => encode(Value::Bool(false)),
-        Token::Int(i, src) => {
-            if let Some(hook) = &ctx.parse_int {
-                let arg = encode(Value::Bytes(src.into_bytes()))?;
-                hook.call("__call__", &[arg.raw()])
-            } else {
-                encode(Value::Int(i))
-            }
-        }
-        Token::Float(f, src) => {
-            if let Some(hook) = &ctx.parse_float {
-                let arg = encode(Value::Bytes(src.into_bytes()))?;
-                hook.call("__call__", &[arg.raw()])
-            } else {
-                encode(Value::Float(f))
-            }
-        }
-        Token::Constant(name) => {
-            if let Some(hook) = &ctx.parse_constant {
-                let arg = encode(Value::Bytes(name.into_bytes()))?;
-                hook.call("__call__", &[arg.raw()])
-            } else {
-                encode(Value::Float(match name.as_str() {
-                    "NaN" => f64::NAN,
-                    "Infinity" => f64::INFINITY,
-                    "-Infinity" => f64::NEG_INFINITY,
-                    _ => return Err(value_err(tk.pos(), "unknown constant")),
-                }))
-            }
-        }
+        Token::Int(i, src) => match &ctx.parse_int {
+            Some(hook) => hook.call("__call__", &[encode(Value::Bytes(src.into_bytes()))?.raw()]),
+            None => encode(Value::Int(i)),
+        },
+        Token::Float(f, src) => match &ctx.parse_float {
+            Some(hook) => hook.call("__call__", &[encode(Value::Bytes(src.into_bytes()))?.raw()]),
+            None => encode(Value::Float(f)),
+        },
+        Token::Constant(name) => match &ctx.parse_constant {
+            Some(hook) => hook.call("__call__", &[encode(Value::Bytes(name.into_bytes()))?.raw()]),
+            None => encode(Value::Float(match name.as_str() {
+                "NaN" => f64::NAN,
+                "Infinity" => f64::INFINITY,
+                _ => f64::NEG_INFINITY,
+            })),
+        },
         Token::Str(s) => encode(Value::Bytes(s.into_bytes())),
         Token::LBracket | Token::LBrace if depth >= MAX_DEPTH => {
             Err(Error::Runtime(format!("maximum JSON nesting depth ({}) exceeded at byte {}", MAX_DEPTH, tk.pos())))
         }
         Token::LBracket => parse_array(tk, ctx, depth + 1),
         Token::LBrace => parse_object(tk, ctx, depth + 1),
-        Token::RBracket | Token::RBrace | Token::Comma | Token::Colon => {
-            Err(value_err(tk.pos(), "unexpected token"))
-        }
-        Token::Eof => Err(value_err(tk.pos(), "unexpected end of input")),
     }
 }
 
 fn parse_array(tk: &mut Tokenizer, ctx: &LoadCtx, depth: usize) -> Result<Handle> {
     let list = Handle::new_list()?;
-    let first = tk.next_token().map_err(to_pdk_err)?;
-    if matches!(first, Token::RBracket) { return Ok(list); }
-    let mut current = first;
+    if tk.peek() == Some(b']') {
+        tk.bump();
+        return Ok(list);
+    }
     loop {
-        let item = parse_value_with(tk, current, ctx, depth)?;
+        let item = parse_value(tk, ctx, depth)?;
         let _ = list.call("append", &[item.raw()])?;
-        match tk.next_token().map_err(to_pdk_err)? {
-            Token::Comma => current = tk.next_token().map_err(to_pdk_err)?,
-            Token::RBracket => return Ok(list),
-            _ => return Err(value_err(tk.pos(), "expected ',' or ']' in array")),
+        match tk.peek() {
+            Some(b']') => { tk.bump(); return Ok(list) }
+            Some(b',') => tk.bump(),
+            _ => return Err(to_pdk_err(tk.fail("Expecting ',' delimiter", tk.pos()))),
         }
     }
 }
 
 fn parse_object(tk: &mut Tokenizer, ctx: &LoadCtx, depth: usize) -> Result<Handle> {
-    // `object_pairs_hook` wins over `object_hook` per Python spec, so gather (key, value) pairs and call the hook on them, skipping dict build.
-    if ctx.object_pairs_hook.is_some() {
-        return parse_object_pairs(tk, ctx, depth);
+    let mut pairs: Vec<(Handle, Handle)> = Vec::new();
+    match tk.peek() {
+        Some(b'}') => tk.bump(),
+        Some(b'"') => loop {
+            let Token::Str(name) = tk.value().map_err(to_pdk_err)? else { unreachable!("a key opens with a quote") };
+            let key = encode(Value::Bytes(name.into_bytes()))?;
+            if tk.peek() != Some(b':') {
+                return Err(to_pdk_err(tk.fail("Expecting ':' delimiter", tk.pos())));
+            }
+            tk.bump();
+            pairs.push((key, parse_value(tk, ctx, depth)?));
+            match tk.peek() {
+                Some(b'}') => { tk.bump(); break }
+                Some(b',') => tk.bump(),
+                _ => return Err(to_pdk_err(tk.fail("Expecting ',' delimiter", tk.pos()))),
+            }
+            if tk.peek() != Some(b'"') {
+                return Err(to_pdk_err(tk.fail("Expecting property name enclosed in double quotes", tk.pos())));
+            }
+        },
+        _ => return Err(to_pdk_err(tk.fail("Expecting property name enclosed in double quotes", tk.pos()))),
+    }
+    // `object_pairs_hook` wins over `object_hook` per Python spec, and takes the pairs as a list of tuples.
+    if let Some(hook) = &ctx.object_pairs_hook {
+        let list = Handle::new_list()?;
+        for (k, v) in &pairs {
+            list.call("append", &[Handle::new_tuple(&[k.raw(), v.raw()])?.raw()])?;
+        }
+        return hook.call("__call__", &[list.raw()]);
     }
     let dict = Handle::new_dict()?;
-    let first = tk.next_token().map_err(to_pdk_err)?;
-    if matches!(first, Token::RBrace) {
-        return apply_object_hook(dict, ctx);
+    for (k, v) in &pairs {
+        dict.set_item(k, v)?;
     }
-    let mut current = first;
-    loop {
-        let key_str = match current {
-            Token::Str(s) => s,
-            _ => return Err(value_err(tk.pos(), "object key must be a string")),
-        };
-        let key = encode(Value::Bytes(key_str.into_bytes()))?;
-        match tk.next_token().map_err(to_pdk_err)? {
-            Token::Colon => {}
-            _ => return Err(value_err(tk.pos(), "expected ':' after object key")),
-        }
-        let value = parse_value(tk, ctx, depth)?;
-        dict.set_item(&key, &value)?;
-        match tk.next_token().map_err(to_pdk_err)? {
-            Token::Comma => current = tk.next_token().map_err(to_pdk_err)?,
-            Token::RBrace => return apply_object_hook(dict, ctx),
-            _ => return Err(value_err(tk.pos(), "expected ',' or '}' in object")),
-        }
-    }
-}
-
-fn parse_object_pairs(tk: &mut Tokenizer, ctx: &LoadCtx, depth: usize) -> Result<Handle> {
-    let mut pairs: Vec<(Handle, Handle)> = Vec::new();
-    let first = tk.next_token().map_err(to_pdk_err)?;
-    if !matches!(first, Token::RBrace) {
-        let mut current = first;
-        loop {
-            let key_str = match current {
-                Token::Str(s) => s,
-                _ => return Err(value_err(tk.pos(), "object key must be a string")),
-            };
-            let key = encode(Value::Bytes(key_str.into_bytes()))?;
-            match tk.next_token().map_err(to_pdk_err)? {
-                Token::Colon => {}
-                _ => return Err(value_err(tk.pos(), "expected ':' after object key")),
-            }
-            let value = parse_value(tk, ctx, depth)?;
-            pairs.push((key, value));
-            match tk.next_token().map_err(to_pdk_err)? {
-                Token::Comma => current = tk.next_token().map_err(to_pdk_err)?,
-                Token::RBrace => break,
-                _ => return Err(value_err(tk.pos(), "expected ',' or '}' in object")),
-            }
-        }
-    }
-    // Materialise as `list[list[key, val]]`, the hook can `tuple(p) for p in pairs` if it needs Python's `list[tuple]`.
-    let list = Handle::new_list()?;
-    for (k, v) in pairs {
-        let pair = Handle::new_list()?;
-        pair.call("append", &[k.raw()])?;
-        pair.call("append", &[v.raw()])?;
-        list.call("append", &[pair.raw()])?;
-    }
-    let hook = ctx.object_pairs_hook.as_ref().unwrap();
-    hook.call("__call__", &[list.raw()])
-}
-
-fn apply_object_hook(dict: Handle, ctx: &LoadCtx) -> Result<Handle> {
-    if let Some(hook) = &ctx.object_hook {
-        hook.call("__call__", &[dict.raw()])
-    } else {
-        Ok(dict)
+    match &ctx.object_hook {
+        Some(hook) => hook.call("__call__", &[dict.raw()]),
+        None => Ok(dict),
     }
 }
 
 fn to_pdk_err(e: JsonError) -> Error {
-    Error::Value(format!("{} at byte {}", e.msg, e.pos))
-}
-
-fn value_err(pos: usize, msg: &str) -> Error {
-    Error::Value(format!("{} at byte {}", msg, pos))
+    Error::Value(e.0)
 }

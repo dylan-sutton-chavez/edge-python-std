@@ -5,13 +5,13 @@ I = IGNORECASE = 2
 M = MULTILINE = 8
 S = DOTALL = 16
 U = UNICODE = 32
+X = VERBOSE = 64
+A = ASCII = 256
 
 # A bad pattern raises ValueError, the one exception class a program can catch it as.
 error = ValueError
 
-# Each flag becomes the inline group the engine reads at the start of a pattern.
-_INLINE = ((I, "i"), (M, "m"), (S, "s"))
-_NAMES = ((I, "IGNORECASE"), (M, "MULTILINE"), (S, "DOTALL"))
+_NAMES = ((I, "IGNORECASE"), (M, "MULTILINE"), (S, "DOTALL"), (X, "VERBOSE"), (A, "ASCII"))
 
 # The characters a pattern gives meaning to, each escaped with a backslash.
 _SPECIAL = "()[]{}?*+-|^$\\.&~# \t\n\r\v\f"
@@ -67,13 +67,13 @@ class Match:
 class Pattern:
     def __init__(self, pattern, flags):
         self.pattern = pattern
-        self.flags = flags | UNICODE
-        inline = "".join(letter for flag, letter in _INLINE if flags & flag)
-        self._source = f"(?{inline}){pattern}" if inline else pattern
-        self.groups, self.groupindex = _info(self._source)
+        self._flags = flags
+        self.groups, self.groupindex, found = _info(pattern, flags)
+        # A str pattern is Unicode unless it asks for ASCII, as Python reports it.
+        self.flags = found | (0 if found & ASCII else UNICODE)
 
     def _one(self, string, mode):
-        spans = _find(self._source, string, mode)
+        spans = _find(self.pattern, self._flags, string, mode)
         return None if spans is None else Match(self, string, spans)
 
     def search(self, string):
@@ -87,7 +87,7 @@ class Pattern:
 
     # Every match up to `limit`, zero meaning all, which sub and split cap by their count.
     def _all(self, string, limit):
-        for spans in _find_all(self._source, string, limit):
+        for spans in _find_all(self.pattern, self._flags, string, limit):
             yield Match(self, string, spans)
 
     def finditer(self, string):
@@ -102,7 +102,7 @@ class Pattern:
 
     def subn(self, repl, string, count=0):
         if not callable(repl):
-            text, n = _sub(self._source, repl, string, count)
+            text, n = _sub(self.pattern, self._flags, repl, string, count)
             return (text, n)
         pieces, last, n = [], 0, 0
         for m in self._all(string, count):

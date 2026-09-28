@@ -92,7 +92,7 @@ re.compile('hola', re.IGNORECASE) <re.Match object; span=(1, 5), match='HOLA'>
 1\+1=2\?
 ```
 
-A bad pattern raises `re.error`, which is `ValueError` here, and a pattern that backtracks without end raises `RuntimeError` instead of hanging. Verbose patterns and `bytes` patterns are not supported.
+A bad pattern raises `re.error`, which is `ValueError` here, and a pattern that backtracks without end raises `RuntimeError` instead of hanging. `bytes` patterns are not supported.
 
 ```edge-python
 import re
@@ -109,6 +109,6 @@ except RuntimeError as e:
 ```
 
 ```output
-bad pattern: missing closing parenthesis at position 11
+bad pattern: missing ), unterminated subpattern at position 0
 too slow: catastrophic backtracking: O(n^2) time or worse on this input, simplify nested quantifiers
 ```

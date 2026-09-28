@@ -3,3 +3,4 @@ Cargo.lock
 *.edge
 *.wasm
 .DS_STORE
+edge.lock

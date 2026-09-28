@@ -1,8 +1,12 @@
-use alloc::{boxed::Box, string::String, vec::Vec};
+use alloc::{boxed::Box, format, string::String, vec, vec::Vec};
 use super::ast::*;
+use super::matcher::fixed_len;
 
-/* Parse a pattern into a Program or fail with a positioned error. */
-pub fn parse(pattern: &str) -> Result<Program, ParseError> {
+// Python caps a repeat count below this, and a larger one overflows.
+const MAXREPEAT: u64 = 4_294_967_295;
+
+/* Parse a pattern under its flags into a Program, or fail where Python fails and in its words. */
+pub fn parse(pattern: &str, flags: Flags) -> Result<Program, ParseError> {
     let chars: Vec<char> = pattern.chars().collect();
     let mut p = Parser {
         p: &chars,
@@ -10,13 +14,20 @@ pub fn parse(pattern: &str) -> Result<Program, ParseError> {
         group_count: 0,
         names: Vec::new(),
         open: Vec::new(),
-        flags: Flags::default(),
+        widths: vec![None],
+        refs: Vec::new(),
+        flags,
+        global: flags,
     };
-    let root = p.alternation()?;
+    let root = p.alternation(true)?;
     if p.pos != p.p.len() {
-        return Err(p.err("unbalanced parenthesis"));
+        return Err(p.at("unbalanced parenthesis", p.pos));
     }
-    Ok(Program { root, group_count: p.group_count, names: p.names, flags: p.flags })
+    // A condition may name a group that opens later, so its number is checked once every group is counted.
+    if let Some(&(group, at)) = p.refs.iter().find(|(group, _)| *group > p.group_count) {
+        return Err(p.at(format!("invalid group reference {group}"), at));
+    }
+    Ok(Program { root, group_count: p.group_count, names: p.names, flags: p.global })
 }
 
 struct Parser<'a> {
@@ -25,255 +36,401 @@ struct Parser<'a> {
     group_count: usize,
     names: Vec<(String, usize)>,
     open: Vec<usize>, // indexes of groups whose closing paren is still ahead
-    flags: Flags,
+    widths: Vec<Option<usize>>, // each group's fixed width once it closes
+    refs: Vec<(usize, usize)>, // numbered conditions and where each names its group
+    flags: Flags, // what the node being parsed is under
+    global: Flags,
 }
 
 impl<'a> Parser<'a> {
     fn peek(&self) -> Option<char> { self.p.get(self.pos).copied() }
-    fn at(&self, i: usize) -> Option<char> { self.p.get(self.pos + i).copied() }
+
     fn bump(&mut self) -> Option<char> {
         let c = self.peek();
         if c.is_some() { self.pos += 1; }
         c
     }
-    fn err(&self, msg: &'static str) -> ParseError { ParseError { msg, pos: self.pos } }
 
-    fn expect(&mut self, c: char) -> Result<(), ParseError> {
-        if self.peek() == Some(c) { self.bump(); Ok(()) }
-        else { Err(self.err("missing closing parenthesis")) }
+    fn eat(&mut self, c: char) -> bool {
+        let hit = self.peek() == Some(c);
+        if hit { self.pos += 1; }
+        hit
     }
+
+    fn at(&self, msg: impl Into<String>, pos: usize) -> ParseError { ParseError::At(msg.into(), pos) }
+
+    fn text(&self, from: usize, to: usize) -> String { self.p[from..to].iter().collect() }
 
     /* Lowest precedence, branches split on the pipe. */
-    fn alternation(&mut self) -> Result<Node, ParseError> {
-        let mut branches = Vec::new();
-        branches.push(self.concat()?);
-        while self.peek() == Some('|') {
-            self.bump();
-            branches.push(self.concat()?);
+    fn alternation(&mut self, first: bool) -> Result<Node, ParseError> {
+        let mut branches = vec![self.concat(first)?];
+        while self.eat('|') {
+            branches.push(self.concat(false)?);
         }
-        if branches.len() == 1 { Ok(branches.pop().unwrap()) }
-        else { Ok(Node::Alt(branches)) }
+        Ok(if branches.len() == 1 { branches.pop().unwrap() } else { Node::Alt(branches) })
     }
 
-    /* A run of quantified atoms until pipe, close paren, or end. */
-    fn concat(&mut self) -> Result<Node, ParseError> {
+    /* A run of items until pipe, close paren, or end, each quantifier binding to the item before it. */
+    fn concat(&mut self, first: bool) -> Result<Node, ParseError> {
         let mut items = Vec::new();
         loop {
+            self.skip_verbose();
             match self.peek() {
                 None | Some('|') | Some(')') => break,
-                _ => items.push(self.quantified()?),
-            }
-        }
-        match items.len() {
-            0 => Ok(Node::Empty),
-            1 => Ok(items.pop().unwrap()),
-            _ => Ok(Node::Concat(items)),
-        }
-    }
-
-    /* An atom plus optional repetition operator. */
-    fn quantified(&mut self) -> Result<Node, ParseError> {
-        let atom = self.atom()?;
-        let (min, max) = match self.peek() {
-            Some('*') => { self.bump(); (0, None) }
-            Some('+') => { self.bump(); (1, None) }
-            Some('?') => { self.bump(); (0, Some(1)) }
-            Some('{') => match self.try_bound()? {
-                Some(b) => b,
-                None => return Ok(atom), // a bare brace is a literal
-            },
-            _ => return Ok(atom),
-        };
-        let greedy = if self.peek() == Some('?') { self.bump(); false } else { true };
-        if matches!(self.peek(), Some('*') | Some('+')) {
-            return Err(self.err("multiple repeat"));
-        }
-        Ok(Node::Repeat { node: Box::new(atom), min, max, greedy })
-    }
-
-    /* Parse a counted bound, restoring position when it is not one. */
-    fn try_bound(&mut self) -> Result<Option<(usize, Option<usize>)>, ParseError> {
-        let save = self.pos;
-        self.bump(); // opening brace
-        let lo = self.read_int();
-        match self.peek() {
-            Some('}') => match lo {
-                Some(n) => { self.bump(); Ok(Some((n, Some(n)))) }
-                None => { self.pos = save; Ok(None) }
-            },
-            Some(',') => {
-                self.bump();
-                let hi = self.read_int();
-                if self.peek() == Some('}') {
-                    self.bump();
-                    Ok(Some((lo.unwrap_or(0), hi)))
-                } else {
-                    self.pos = save;
-                    Ok(None)
-                }
-            }
-            _ => { self.pos = save; Ok(None) }
-        }
-    }
-
-    fn read_int(&mut self) -> Option<usize> {
-        let start = self.pos;
-        let mut n: usize = 0;
-        while let Some(d) = self.peek().and_then(|c| c.to_digit(10)) {
-            n = n.saturating_mul(10).saturating_add(d as usize);
-            self.bump();
-        }
-        if self.pos == start { None } else { Some(n) }
-    }
-
-    fn atom(&mut self) -> Result<Node, ParseError> {
-        match self.peek() {
-            Some('(') => self.group(),
-            Some('[') => self.class(),
-            Some('.') => { self.bump(); Ok(Node::AnyChar) }
-            Some('^') => { self.bump(); Ok(Node::Start) }
-            Some('$') => { self.bump(); Ok(Node::End) }
-            Some('\\') => self.escape(),
-            Some('*') | Some('+') | Some('?') => Err(self.err("nothing to repeat")),
-            Some(c) => { self.bump(); Ok(Node::Char(c)) }
-            None => Ok(Node::Empty),
-        }
-    }
-
-    fn group(&mut self) -> Result<Node, ParseError> {
-        self.bump(); // open paren
-        if self.peek() != Some('?') {
-            self.group_count += 1;
-            let index = self.group_count;
-            self.open.push(index);
-            let node = self.alternation()?;
-            self.expect(')')?;
-            self.open.pop();
-            return Ok(Node::Group { index, name: None, node: Box::new(node) });
-        }
-        self.bump(); // question mark
-        match self.peek() {
-            Some(':') => { self.bump(); let n = self.alternation()?; self.expect(')')?; Ok(Node::NonCap(Box::new(n))) }
-            Some('=') => { self.bump(); self.look(false, false) }
-            Some('!') => { self.bump(); self.look(false, true) }
-            Some('<') => {
-                self.bump();
-                match self.peek() {
-                    Some('=') => { self.bump(); self.look(true, false) }
-                    Some('!') => { self.bump(); self.look(true, true) }
-                    _ => { let name = self.read_name('>')?; self.named_group(name) }
-                }
-            }
-            Some('P') => {
-                self.bump();
-                match self.peek() {
-                    Some('<') => { self.bump(); let name = self.read_name('>')?; self.named_group(name) }
-                    Some('=') => { self.bump(); let name = self.read_name(')')?; self.named_backref(&name) }
-                    _ => Err(self.err("unknown extension")),
-                }
-            }
-            Some('#') => {
-                while let Some(c) = self.peek() { if c == ')' { break; } self.bump(); }
-                self.expect(')')?;
-                Ok(Node::Empty)
-            }
-            Some(c) if is_flag_char(c) => { self.read_flags()?; self.expect(')')?; Ok(Node::Empty) }
-            _ => Err(self.err("unknown extension")),
-        }
-    }
-
-    fn look(&mut self, behind: bool, negative: bool) -> Result<Node, ParseError> {
-        let node = self.alternation()?;
-        self.expect(')')?;
-        Ok(Node::Look { node: Box::new(node), behind, negative })
-    }
-
-    /* Assign the index before the body so order matches paren order. */
-    fn named_group(&mut self, name: String) -> Result<Node, ParseError> {
-        self.group_count += 1;
-        let index = self.group_count;
-        self.names.push((name.clone(), index));
-        self.open.push(index);
-        let node = self.alternation()?;
-        self.expect(')')?;
-        self.open.pop();
-        Ok(Node::Group { index, name: Some(name), node: Box::new(node) })
-    }
-
-    fn named_backref(&mut self, name: &str) -> Result<Node, ParseError> {
-        let idx = self.names.iter().find(|(n, _)| n == name).map(|(_, i)| *i);
-        match idx {
-            Some(i) => Ok(Node::Backref(i)),
-            None => Err(self.err("unknown group name")),
-        }
-    }
-
-    fn read_name(&mut self, term: char) -> Result<String, ParseError> {
-        let mut s = String::new();
-        while let Some(c) = self.peek() {
-            if c == term { break; }
-            s.push(c);
-            self.bump();
-        }
-        if self.peek() != Some(term) { return Err(self.err("missing group name terminator")); }
-        self.bump();
-        if s.is_empty() { return Err(self.err("missing group name")); }
-        Ok(s)
-    }
-
-    fn read_flags(&mut self) -> Result<(), ParseError> {
-        while let Some(c) = self.peek() {
-            match c {
-                'i' => { self.flags.ignorecase = true; self.bump(); }
-                's' => { self.flags.dotall = true; self.bump(); }
-                'm' => { self.flags.multiline = true; self.bump(); }
-                'a' | 'L' | 'u' | 'x' => { self.bump(); } // accepted but inert in this version
-                ')' => break,
-                _ => return Err(self.err("unknown flag")),
-            }
-        }
-        Ok(())
-    }
-
-    fn class(&mut self) -> Result<Node, ParseError> {
-        self.bump(); // open bracket
-        let negated = if self.peek() == Some('^') { self.bump(); true } else { false };
-        let mut items = Vec::new();
-        if self.peek() == Some(']') { items.push(ClassItem::Ch(']')); self.bump(); }
-        loop {
-            match self.peek() {
-                None => return Err(self.err("unterminated character set")),
-                Some(']') => { self.bump(); break; }
-                Some('\\') => { self.bump(); items.push(self.class_escape()?); }
-                Some(c) => {
-                    self.bump();
-                    let is_range = self.peek() == Some('-')
-                        && self.at(1).is_some()
-                        && self.at(1) != Some(']');
-                    if is_range {
-                        self.bump(); // dash
-                        let end = if self.peek() == Some('\\') {
-                            self.bump();
-                            match self.class_escape()? {
-                                ClassItem::Ch(e) => e,
-                                _ => return Err(self.err("bad character range")),
-                            }
-                        } else {
-                            self.bump().unwrap()
-                        };
-                        if (end as u32) < (c as u32) { return Err(self.err("bad character range")); }
-                        items.push(ClassItem::Range(c, end));
-                    } else {
-                        items.push(ClassItem::Ch(c));
+                Some('*' | '+' | '?' | '{') => self.quantify(&mut items)?,
+                _ => {
+                    if let Some(item) = self.atom(first && items.is_empty())? {
+                        items.push(item);
                     }
                 }
             }
         }
-        Ok(Node::Class { items, negated })
+        Ok(match items.len() {
+            0 => Node::Empty,
+            1 => items.pop().unwrap(),
+            _ => Node::Concat(items),
+        })
     }
 
-    fn class_escape(&mut self) -> Result<ClassItem, ParseError> {
-        let c = self.bump().ok_or(self.err("trailing backslash"))?;
+    // Under verbose, whitespace and a comment up to the end of its line stand for nothing.
+    fn skip_verbose(&mut self) {
+        while self.flags.verbose {
+            match self.peek() {
+                Some(' ' | '\t' | '\n' | '\r' | '\u{0B}' | '\u{0C}') => self.pos += 1,
+                Some('#') => while self.bump().is_some_and(|c| c != '\n') {},
+                _ => break,
+            }
+        }
+    }
+
+    // A quantifier repeats the item before it, which may be neither missing, an anchor, nor a repeat already.
+    fn quantify(&mut self, items: &mut Vec<Node>) -> Result<(), ParseError> {
+        let at = self.pos;
+        let (min, max) = match self.bump() {
+            Some('*') => (0, None),
+            Some('+') => (1, None),
+            Some('?') => (0, Some(1)),
+            _ => match self.bound()? {
+                Some(bound) => bound,
+                None => {
+                    items.push(Node::Char('{', self.flags));
+                    return Ok(());
+                }
+            },
+        };
+        match items.last() {
+            None | Some(Node::Start(_) | Node::End(_) | Node::StringStart | Node::StringEnd | Node::WordBoundary(_) | Node::NotWordBoundary(_)) => {
+                return Err(self.at("nothing to repeat", at));
+            }
+            Some(Node::Repeat { .. }) => return Err(self.at("multiple repeat", at)),
+            _ => {}
+        }
+        let greedy = !self.eat('?');
+        let possessive = greedy && self.eat('+');
+        let node = Box::new(items.pop().unwrap());
+        items.push(Node::Repeat { node, min, max, greedy, possessive });
+        Ok(())
+    }
+
+    /* A counted bound after its brace, None when the text only reads as a literal brace. */
+    fn bound(&mut self) -> Result<Option<(usize, Option<usize>)>, ParseError> {
+        let here = self.pos;
+        if self.peek() == Some('}') {
+            return Ok(None);
+        }
+        let lo = self.digits();
+        let hi = if self.eat(',') { self.digits() } else { lo.clone() };
+        if !self.eat('}') {
+            self.pos = here;
+            return Ok(None);
+        }
+        let count = |digits: &str| match digits.parse::<u64>() {
+            Ok(n) if n < MAXREPEAT => Ok(n as usize),
+            _ => Err(ParseError::Overflow),
+        };
+        let min = if lo.is_empty() { 0 } else { count(&lo)? };
+        let max = if hi.is_empty() { None } else { Some(count(&hi)?) };
+        if max.is_some_and(|max| max < min) {
+            return Err(self.at("min repeat greater than max repeat", here));
+        }
+        Ok(Some((min, max)))
+    }
+
+    fn digits(&mut self) -> String {
+        let from = self.pos;
+        while self.peek().is_some_and(|c| c.is_ascii_digit()) { self.pos += 1; }
+        self.text(from, self.pos)
+    }
+
+    // One item, None for what stands for nothing, like a comment or global flags.
+    fn atom(&mut self, first: bool) -> Result<Option<Node>, ParseError> {
+        let f = self.flags;
+        Ok(Some(match self.peek().unwrap() {
+            '(' => return self.group(first),
+            '[' => self.class()?,
+            '\\' => self.escape()?,
+            '.' => { self.pos += 1; Node::AnyChar(f) }
+            '^' => { self.pos += 1; Node::Start(f) }
+            '$' => { self.pos += 1; Node::End(f) }
+            c => { self.pos += 1; Node::Char(c, f) }
+        }))
+    }
+
+    fn group(&mut self, first: bool) -> Result<Option<Node>, ParseError> {
+        let start = self.pos;
+        self.pos += 1;
+        if !self.eat('?') {
+            return self.capture(start, None).map(Some);
+        }
+        let Some(c) = self.bump() else { return Err(self.at("unexpected end of pattern", self.pos)) };
+        let node = match c {
+            ':' => Node::NonCap(Box::new(self.body(start, self.flags)?)),
+            '>' => Node::Atomic(Box::new(self.body(start, self.flags)?)),
+            '=' | '!' => self.look(start, false, c == '!')?,
+            '<' => match self.bump() {
+                Some(d @ ('=' | '!')) => self.look(start, true, d == '!')?,
+                Some(d) => return Err(self.at(format!("unknown extension ?<{d}"), start + 1)),
+                None => return Err(self.at("unexpected end of pattern", self.pos)),
+            },
+            'P' => match self.bump() {
+                Some('<') => {
+                    let (name, begin) = self.name('>')?;
+                    self.identifier(&name, begin)?;
+                    return self.capture(start, Some((name, begin))).map(Some);
+                }
+                Some('=') => {
+                    let (name, begin) = self.name(')')?;
+                    self.identifier(&name, begin)?;
+                    let index = self.named(&name, begin)?;
+                    if self.open.contains(&index) {
+                        return Err(self.at("cannot refer to an open group", begin));
+                    }
+                    Node::Backref(index, self.flags)
+                }
+                Some(d) => return Err(self.at(format!("unknown extension ?P{d}"), start + 1)),
+                None => return Err(self.at("unexpected end of pattern", self.pos)),
+            },
+            '#' => loop {
+                match self.bump() {
+                    Some(')') => return Ok(None),
+                    Some(_) => {}
+                    None => return Err(self.at("missing ), unterminated comment", start)),
+                }
+            },
+            '(' => self.condition(start)?,
+            c if is_flag(c) || c == '-' => return self.inline_flags(start, c, first),
+            c => return Err(self.at(format!("unknown extension ?{c}"), start + 1)),
+        };
+        Ok(Some(node))
+    }
+
+    // A group's body under the flags it opens with, closed by its own parenthesis.
+    fn body(&mut self, start: usize, flags: Flags) -> Result<Node, ParseError> {
+        let outer = core::mem::replace(&mut self.flags, flags);
+        let node = self.alternation(false);
+        self.flags = outer;
+        let node = node?;
+        if !self.eat(')') {
+            return Err(self.at("missing ), unterminated subpattern", start));
+        }
+        Ok(node)
+    }
+
+    // A look-behind steps back a fixed width, so a body without one is refused as Python refuses it.
+    fn look(&mut self, start: usize, behind: bool, negative: bool) -> Result<Node, ParseError> {
+        let node = self.body(start, self.flags)?;
+        let width = if behind {
+            fixed_len(&node, &self.widths).ok_or_else(|| ParseError::Bare(String::from("look-behind requires fixed-width pattern")))?
+        } else {
+            0
+        };
+        Ok(Node::Look { node: Box::new(node), behind, negative, width })
+    }
+
+    /* Assign the index before the body so order matches paren order. */
+    fn capture(&mut self, start: usize, name: Option<(String, usize)>) -> Result<Node, ParseError> {
+        self.group_count += 1;
+        let index = self.group_count;
+        self.widths.push(None);
+        let name = match name {
+            Some((name, begin)) => {
+                if let Some(&(_, was)) = self.names.iter().find(|(n, _)| *n == name) {
+                    return Err(self.at(format!("redefinition of group name '{name}' as group {index}; was group {was}"), begin));
+                }
+                self.names.push((name.clone(), index));
+                Some(name)
+            }
+            None => None,
+        };
+        self.open.push(index);
+        let node = self.body(start, self.flags)?;
+        self.open.pop();
+        self.widths[index] = fixed_len(&node, &self.widths);
+        Ok(Node::Group { index, name, node: Box::new(node) })
+    }
+
+    /* A group name up to its terminator, and where it begins. */
+    fn name(&mut self, term: char) -> Result<(String, usize), ParseError> {
+        let begin = self.pos;
+        let mut name = String::new();
+        loop {
+            match self.bump() {
+                Some(c) if c == term => break,
+                Some(c) => name.push(c),
+                None if name.is_empty() => return Err(self.at("missing group name", self.pos)),
+                None => return Err(self.at(format!("missing {term}, unterminated name"), begin)),
+            }
+        }
+        if name.is_empty() {
+            return Err(self.at("missing group name", self.pos - 1));
+        }
+        Ok((name, begin))
+    }
+
+    // Python wants a group name to read as an identifier.
+    fn identifier(&self, name: &str, begin: usize) -> Result<(), ParseError> {
+        let mut chars = name.chars();
+        let head = chars.next().is_some_and(|c| c == '_' || c.is_alphabetic());
+        if head && chars.all(|c| c == '_' || c.is_alphanumeric()) {
+            Ok(())
+        } else {
+            Err(self.at(format!("bad character in group name '{name}'"), begin))
+        }
+    }
+
+    fn named(&self, name: &str, begin: usize) -> Result<usize, ParseError> {
+        let found = self.names.iter().find(|(n, _)| n == name).map(|(_, index)| *index);
+        found.ok_or_else(|| self.at(format!("unknown group name '{name}'"), begin))
+    }
+
+    /* A conditional group, the yes branch when the group took part and the no branch otherwise. */
+    fn condition(&mut self, start: usize) -> Result<Node, ParseError> {
+        let (name, begin) = self.name(')')?;
+        let group = if name.bytes().all(|b| b.is_ascii_digit()) {
+            match name.parse::<usize>() {
+                Ok(0) => return Err(self.at("bad group number", begin)),
+                Ok(group) => {
+                    self.refs.push((group, begin));
+                    group
+                }
+                Err(_) => return Err(self.at(format!("invalid group reference {name}"), begin)),
+            }
+        } else {
+            self.identifier(&name, begin)?;
+            self.named(&name, begin)?
+        };
+        let yes = self.concat(false)?;
+        let no = if self.eat('|') {
+            let no = self.concat(false)?;
+            if self.peek() == Some('|') {
+                return Err(self.at("conditional backref with more than two branches", self.pos));
+            }
+            no
+        } else {
+            Node::Empty
+        };
+        if !self.eat(')') {
+            return Err(self.at("missing ), unterminated subpattern", start));
+        }
+        Ok(Node::Cond { group, yes: Box::new(yes), no: Box::new(no) })
+    }
+
+    /* Inline flags, global ones at the very start of the pattern and scoped ones over a group's body. */
+    fn inline_flags(&mut self, start: usize, mut c: char, at_start: bool) -> Result<Option<Node>, ParseError> {
+        let (mut on, mut off) = (String::new(), String::new());
+        if c != '-' {
+            loop {
+                if c == 'L' {
+                    return Err(self.at("bad inline flags: cannot use 'L' flag with a str pattern", self.pos));
+                }
+                on.push(c);
+                if on.contains('a') && on.contains('u') {
+                    return Err(self.at("bad inline flags: flags 'a', 'u' and 'L' are incompatible", self.pos));
+                }
+                match self.bump() {
+                    Some(d @ (')' | '-' | ':')) => { c = d; break; }
+                    Some(d) if is_flag(d) => c = d,
+                    Some(d) => return Err(self.at(if d.is_alphabetic() { "unknown flag" } else { "missing -, : or )" }, self.pos - 1)),
+                    None => return Err(self.at("missing -, : or )", self.pos)),
+                }
+            }
+        }
+        if c == ')' {
+            if !at_start {
+                return Err(self.at("global flags not at the start of the expression", start));
+            }
+            for letter in on.chars() {
+                self.flags = self.flags.with(letter, true);
+                self.global = self.global.with(letter, true);
+            }
+            return Ok(None);
+        }
+        if c == '-' {
+            c = match self.bump() {
+                Some(d) if is_flag(d) => d,
+                Some(d) => return Err(self.at(if d.is_alphabetic() { "unknown flag" } else { "missing flag" }, self.pos - 1)),
+                None => return Err(self.at("missing flag", self.pos)),
+            };
+            loop {
+                if matches!(c, 'a' | 'u' | 'L') {
+                    return Err(self.at("bad inline flags: cannot turn off flags 'a', 'u' and 'L'", self.pos));
+                }
+                off.push(c);
+                match self.bump() {
+                    Some(':') => break,
+                    Some(d) if is_flag(d) => c = d,
+                    Some(d) => return Err(self.at(if d.is_alphabetic() { "unknown flag" } else { "missing :" }, self.pos - 1)),
+                    None => return Err(self.at("missing :", self.pos)),
+                }
+            }
+        }
+        if on.chars().any(|letter| off.contains(letter)) {
+            return Err(self.at("bad inline flags: flag turned on and off", self.pos - 1));
+        }
+        let flags = on.chars().fold(self.flags, |f, letter| f.with(letter, true));
+        let flags = off.chars().fold(flags, |f, letter| f.with(letter, false));
+        Ok(Some(Node::NonCap(Box::new(self.body(start, flags)?))))
+    }
+
+    /* A bracket set, where a closing bracket right after the opening one is a literal. */
+    fn class(&mut self) -> Result<Node, ParseError> {
+        let here = self.pos;
+        self.pos += 1;
+        let negated = self.eat('^');
+        let mut items = Vec::new();
+        loop {
+            let from = self.pos;
+            let item = match self.bump() {
+                None => return Err(self.at("unterminated character set", here)),
+                Some(']') if !items.is_empty() => break,
+                Some('\\') => self.class_escape(from)?,
+                Some(c) => ClassItem::Ch(c),
+            };
+            if !self.eat('-') {
+                items.push(item);
+                continue;
+            }
+            let to = self.pos;
+            let end = match self.bump() {
+                None => return Err(self.at("unterminated character set", here)),
+                Some(']') => {
+                    items.push(item);
+                    items.push(ClassItem::Ch('-'));
+                    break;
+                }
+                Some('\\') => self.class_escape(to)?,
+                Some(c) => ClassItem::Ch(c),
+            };
+            match (item, end) {
+                (ClassItem::Ch(lo), ClassItem::Ch(hi)) if lo <= hi => items.push(ClassItem::Range(lo, hi)),
+                _ => return Err(self.at(format!("bad character range {}-{}", self.text(from, to - 1), self.text(to, self.pos)), from)),
+            }
+        }
+        Ok(Node::Class { items, negated, flags: self.flags })
+    }
+
+    fn class_escape(&mut self, start: usize) -> Result<ClassItem, ParseError> {
+        let Some(c) = self.bump() else { return Err(self.at("bad escape (end of pattern)", start)) };
         Ok(match c {
             'd' => ClassItem::Digit,
             'D' => ClassItem::NotDigit,
@@ -281,92 +438,142 @@ impl<'a> Parser<'a> {
             'W' => ClassItem::NotWord,
             's' => ClassItem::Space,
             'S' => ClassItem::NotSpace,
-            'n' => ClassItem::Ch('\n'),
-            't' => ClassItem::Ch('\t'),
-            'r' => ClassItem::Ch('\r'),
-            'f' => ClassItem::Ch('\u{0C}'),
-            'v' => ClassItem::Ch('\u{0B}'),
-            'a' => ClassItem::Ch('\u{07}'),
-            'b' => ClassItem::Ch('\u{08}'), // backspace inside a set
-            '0' => ClassItem::Ch('\0'),
-            'x' => ClassItem::Ch(self.read_hex(2)?),
-            'u' => ClassItem::Ch(self.read_hex(4)?),
-            other => ClassItem::Ch(other), // lenient, escaped literal
+            _ => ClassItem::Ch(self.literal(start, c, true)?),
         })
     }
 
     fn escape(&mut self) -> Result<Node, ParseError> {
-        self.bump(); // backslash
-        let c = self.bump().ok_or(self.err("trailing backslash"))?;
+        let start = self.pos;
+        self.pos += 1;
+        let Some(c) = self.bump() else { return Err(self.at("bad escape (end of pattern)", start)) };
+        let f = self.flags;
+        let class = |item| Node::Class { items: vec![item], negated: false, flags: f };
         Ok(match c {
-            'd' => Node::Class { items: single(ClassItem::Digit), negated: false },
-            'D' => Node::Class { items: single(ClassItem::NotDigit), negated: false },
-            'w' => Node::Class { items: single(ClassItem::Word), negated: false },
-            'W' => Node::Class { items: single(ClassItem::NotWord), negated: false },
-            's' => Node::Class { items: single(ClassItem::Space), negated: false },
-            'S' => Node::Class { items: single(ClassItem::NotSpace), negated: false },
-            'b' => Node::WordBoundary,
-            'B' => Node::NotWordBoundary,
-            'n' => Node::Char('\n'),
-            't' => Node::Char('\t'),
-            'r' => Node::Char('\r'),
-            'f' => Node::Char('\u{0C}'),
-            'v' => Node::Char('\u{0B}'),
-            'a' => Node::Char('\u{07}'),
-            '0' => Node::Char('\0'),
-            'x' => Node::Char(self.read_hex(2)?),
-            'u' => Node::Char(self.read_hex(4)?),
-            '1'..='9' => {
-                let mut n = c.to_digit(10).unwrap() as usize;
-                while let Some(d) = self.peek().and_then(|x| x.to_digit(10)) {
-                    let cand = n * 10 + d as usize;
-                    if cand <= self.group_count { n = cand; self.bump(); } else { break; }
-                }
-                if n > self.group_count { return Err(self.err("invalid group reference")); }
-                if self.open.contains(&n) { return Err(self.err("cannot refer to an open group")); }
-                Node::Backref(n)
-            }
-            l if l.is_ascii_alphabetic() => return Err(self.err("bad escape")),
-            other => Node::Char(other), // escaped metacharacter
+            'A' => Node::StringStart,
+            'Z' => Node::StringEnd,
+            'b' => Node::WordBoundary(f),
+            'B' => Node::NotWordBoundary(f),
+            'd' => class(ClassItem::Digit),
+            'D' => class(ClassItem::NotDigit),
+            'w' => class(ClassItem::Word),
+            'W' => class(ClassItem::NotWord),
+            's' => class(ClassItem::Space),
+            'S' => class(ClassItem::NotSpace),
+            '1'..='9' => self.reference(start, c)?,
+            _ => Node::Char(self.literal(start, c, false)?, f),
         })
     }
 
-    fn read_hex(&mut self, n: usize) -> Result<char, ParseError> {
-        let mut acc: u32 = 0;
-        for _ in 0..n {
-            let d = self.peek().and_then(|c| c.to_digit(16)).ok_or(self.err("bad hex escape"))?;
-            acc = acc * 16 + d;
-            self.bump();
+    // Three octal digits make a character, and anything shorter names a group that has already closed.
+    fn reference(&mut self, start: usize, first: char) -> Result<Node, ParseError> {
+        let mut digits = String::from(first);
+        if let Some(d) = self.peek().filter(char::is_ascii_digit) {
+            self.pos += 1;
+            digits.push(d);
+            if octal(first) && octal(d) && self.peek().is_some_and(octal) {
+                digits.push(self.bump().unwrap());
+                return Ok(Node::Char(self.octal_char(&digits, start)?, self.flags));
+            }
         }
-        char::from_u32(acc).ok_or(self.err("invalid codepoint"))
+        let group: usize = digits.parse().unwrap();
+        if group > self.group_count {
+            return Err(self.at(format!("invalid group reference {group}"), start + 1));
+        }
+        if self.open.contains(&group) {
+            return Err(self.at("cannot refer to an open group", start));
+        }
+        Ok(Node::Backref(group, self.flags))
+    }
+
+    /* The character an escape stands for, in a set or out of one, or Python's error for one it does not know. */
+    fn literal(&mut self, start: usize, c: char, in_class: bool) -> Result<char, ParseError> {
+        Ok(match c {
+            'a' => '\u{07}',
+            'b' => '\u{08}', // reached only inside a set, a boundary outside one
+            'f' => '\u{0C}',
+            'n' => '\n',
+            'r' => '\r',
+            't' => '\t',
+            'v' => '\u{0B}',
+            'x' => self.hex(start, 2)?,
+            'u' => self.hex(start, 4)?,
+            'U' => self.hex(start, 8)?,
+            '0'..='7' if in_class || c == '0' => {
+                let mut digits = String::from(c);
+                while digits.len() < 3 && self.peek().is_some_and(octal) {
+                    digits.push(self.bump().unwrap());
+                }
+                self.octal_char(&digits, start)?
+            }
+            c if c.is_ascii_alphanumeric() => return Err(self.at(format!("bad escape \\{c}"), start)),
+            c => c,
+        })
+    }
+
+    // Exactly n hex digits after x, u or U, naming a character a string can hold.
+    fn hex(&mut self, start: usize, n: usize) -> Result<char, ParseError> {
+        let from = self.pos;
+        while self.pos - from < n && self.peek().is_some_and(|c| c.is_ascii_hexdigit()) {
+            self.pos += 1;
+        }
+        let escape = self.text(start, self.pos);
+        if self.pos - from < n {
+            return Err(self.at(format!("incomplete escape {escape}"), start));
+        }
+        let code = u32::from_str_radix(&self.text(from, self.pos), 16).ok();
+        code.and_then(char::from_u32).ok_or_else(|| self.at(format!("bad escape {escape}"), start))
+    }
+
+    fn octal_char(&self, digits: &str, start: usize) -> Result<char, ParseError> {
+        let value = u32::from_str_radix(digits, 8).unwrap();
+        if value > 0o377 {
+            return Err(self.at(format!("octal escape value \\{digits} outside of range 0-0o377"), start));
+        }
+        Ok(char::from_u32(value).unwrap())
     }
 }
 
-fn single(item: ClassItem) -> Vec<ClassItem> {
-    alloc::vec![item]
+fn octal(c: char) -> bool {
+    ('0'..='7').contains(&c)
 }
 
-fn is_flag_char(c: char) -> bool {
-    matches!(c, 'i' | 's' | 'm' | 'a' | 'L' | 'u' | 'x')
+fn is_flag(c: char) -> bool {
+    matches!(c, 'a' | 'i' | 'L' | 'm' | 's' | 'u' | 'x')
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn backref_requires_an_existing_group() {
-        assert_eq!(parse(r"\1").err().unwrap().msg, "invalid group reference");
-        assert_eq!(parse(r"(a)\2").err().unwrap().msg, "invalid group reference");
-        assert_eq!(parse(r"\1(a)").err().unwrap().msg, "invalid group reference");
-        assert!(parse(r"(a)\1").is_ok());
-        assert!(parse(r"(?P<x>a)\1").is_ok());
-        assert!(parse(r"((a)\2)").is_ok());
+    fn error(pattern: &str) -> String {
+        match parse(pattern, Flags::default()) {
+            Err(ParseError::At(msg, pos)) => format!("{msg} at position {pos}"),
+            Err(ParseError::Bare(msg)) => msg,
+            Err(ParseError::Overflow) => String::from("overflow"),
+            Ok(_) => String::from("ok"),
+        }
     }
 
     #[test]
-    fn backref_to_an_open_group_is_rejected() {
-        assert_eq!(parse(r"(\1)").err().unwrap().msg, "cannot refer to an open group");
-        assert_eq!(parse(r"(a)(\2)").err().unwrap().msg, "cannot refer to an open group");
+    fn errors_read_in_python_words_at_python_positions() {
+        for (pattern, want) in [
+            ("(a", "missing ), unterminated subpattern at position 0"),
+            (r"\q", r"bad escape \q at position 0"),
+            ("[z-a]", "bad character range z-a at position 1"),
+            (r"(a)\12", "invalid group reference 12 at position 4"),
+            (r"(\1)", "cannot refer to an open group at position 1"),
+            ("a(?i)b", "global flags not at the start of the expression at position 1"),
+            ("(?<=a+)b", "look-behind requires fixed-width pattern"),
+            ("x{4294967296}", "overflow"),
+        ] {
+            assert_eq!(error(pattern), want);
+        }
+    }
+
+    #[test]
+    fn python_patterns_parse() {
+        for pattern in [r"(a)(?<=\1)", r"\101\Z", "(?i:a)(?-i:b)", "(a)?(?(1)b|c)", "a*+", "(?>a)", "(?x) a # c"] {
+            assert_eq!(error(pattern), "ok", "{pattern}");
+        }
     }
 }

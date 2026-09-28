@@ -19,7 +19,6 @@ const MAX_STACK: usize = if cfg!(target_arch = "wasm32") { 64 * 1024 } else { 51
 /* Backtracking matcher over codepoints, so offsets are Unicode aware. */
 pub struct Matcher<'a> {
     input: &'a [char],
-    flags: Flags,
     steps: Cell<u64>, // backtracking work counter, cumulative per API call
     budget: u64, // abort once the counter passes this
     stack_base: usize, // caller frame address
@@ -27,11 +26,11 @@ pub struct Matcher<'a> {
 }
 
 impl<'a> Matcher<'a> {
-    pub fn new(input: &'a [char], flags: Flags) -> Self {
+    pub fn new(input: &'a [char]) -> Self {
         // Linear allowance, legitimate matches stay under it, blowups race past it.
         let budget = 100_000 + 2_000 * input.len() as u64;
         let base = 0u8;
-        Self { input, flags, steps: Cell::new(0), budget, stack_base: &base as *const u8 as usize, too_deep: Cell::new(false) }
+        Self { input, steps: Cell::new(0), budget, stack_base: &base as *const u8 as usize, too_deep: Cell::new(false) }
     }
 
     /* Budget or stack exhausted over the whole call. */
@@ -84,13 +83,15 @@ impl<'a> Matcher<'a> {
         if self.stack_base.abs_diff(&here as *const u8 as usize) > MAX_STACK { self.too_deep.set(true); return false; }
         match node {
             Node::Empty => k(pos, caps),
-            Node::Char(_) | Node::AnyChar | Node::Class { .. } => {
+            Node::Char(..) | Node::AnyChar(_) | Node::Class { .. } => {
                 pos < self.input.len() && self.single_match(node, pos) && k(pos + 1, caps)
             }
-            Node::Start => self.at_start(pos) && k(pos, caps),
-            Node::End => self.at_end(pos) && k(pos, caps),
-            Node::WordBoundary => self.boundary(pos) && k(pos, caps),
-            Node::NotWordBoundary => !self.boundary(pos) && k(pos, caps),
+            Node::Start(f) => self.at_start(pos, f.multiline) && k(pos, caps),
+            Node::End(f) => self.at_end(pos, f.multiline) && k(pos, caps),
+            Node::StringStart => pos == 0 && k(pos, caps),
+            Node::StringEnd => pos == self.input.len() && k(pos, caps),
+            Node::WordBoundary(f) => self.boundary(pos, f.ascii) && k(pos, caps),
+            Node::NotWordBoundary(f) => !self.boundary(pos, f.ascii) && k(pos, caps),
             Node::Concat(v) => self.m_seq(v, pos, caps, k),
             Node::Alt(v) => {
                 for branch in v {
@@ -99,6 +100,7 @@ impl<'a> Matcher<'a> {
                 false
             }
             Node::NonCap(inner) => self.m(inner, pos, caps, k),
+            Node::Atomic(inner) => self.commit(caps, k, |caps, found| self.m(inner, pos, caps, found)),
             Node::Group { index, node: inner, .. } => {
                 let index = *index;
                 let start = pos;
@@ -108,14 +110,32 @@ impl<'a> Matcher<'a> {
                     if k(end, caps) { true } else { caps[index] = prev; false }
                 })
             }
-            Node::Repeat { node: inner, min, max, greedy } => {
+            Node::Repeat { node: inner, min, max, greedy, possessive } => {
                 let rep = Rep { node: inner, min: *min, max: *max, greedy: *greedy };
+                if *possessive {
+                    return self.commit(caps, k, |caps, found| self.repeat(&rep, pos, 0, caps, found));
+                }
                 self.repeat(&rep, pos, 0, caps, k)
             }
-            Node::Backref(n) => self.backref(*n, pos, caps, k),
-            Node::Look { node: inner, behind, negative } => {
-                self.look(inner, *behind, *negative, pos, caps, k)
+            Node::Backref(n, f) => self.backref(*n, *f, pos, caps, k),
+            Node::Look { node: inner, behind, negative, width } => {
+                self.look(inner, *behind, *negative, *width, pos, caps, k)
             }
+            Node::Cond { group, yes, no } => {
+                let branch = if caps.get(*group).copied().flatten().is_some() { yes } else { no };
+                self.m(branch, pos, caps, k)
+            }
+        }
+    }
+
+    // The first way `run` succeeds is kept and never backtracked into, as atomic groups and possessive repeats want.
+    fn commit(&self, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool, run: impl FnOnce(&mut Caps, &mut dyn FnMut(usize, &mut Caps) -> bool) -> bool) -> bool {
+        let saved = caps.clone();
+        let mut end = None;
+        run(caps, &mut |e, _| { end = Some(e); true });
+        match end {
+            Some(e) if k(e, caps) => true,
+            _ => { *caps = saved; false }
         }
     }
 
@@ -182,84 +202,56 @@ impl<'a> Matcher<'a> {
         }
     }
 
-    fn backref(&self, n: usize, pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool) -> bool {
+    fn backref(&self, n: usize, f: Flags, pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool) -> bool {
         match caps.get(n).copied().flatten() {
             None => k(pos, caps), // unmatched group behaves like empty
             Some((s, e)) => {
                 let len = e - s;
                 if pos + len > self.input.len() { return false; }
                 for i in 0..len {
-                    if !self.ci_eq(self.input[pos + i], self.input[s + i]) { return false; }
+                    if !same(self.input[pos + i], self.input[s + i], f) { return false; }
                 }
                 k(pos + len, caps)
             }
         }
     }
 
-    fn look(&self, inner: &Node, behind: bool, negative: bool, pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool) -> bool {
-        let matched = if behind {
-            match fixed_len(inner) {
-                Some(w) if pos >= w => {
-                    let mut hit = false;
-                    self.m(inner, pos - w, caps, &mut |end, _| {
-                        if end == pos { hit = true; true } else { false }
-                    });
-                    hit
-                }
-                _ => false,
-            }
-        } else {
-            let mut hit = false;
+    #[allow(clippy::too_many_arguments)]
+    fn look(&self, inner: &Node, behind: bool, negative: bool, width: usize, pos: usize, caps: &mut Caps, k: &mut dyn FnMut(usize, &mut Caps) -> bool) -> bool {
+        let mut hit = false;
+        if !behind {
             self.m(inner, pos, caps, &mut |_, _| { hit = true; true });
-            hit
-        };
-        if matched != negative { k(pos, caps) } else { false }
+        } else if pos >= width {
+            self.m(inner, pos - width, caps, &mut |end, _| { hit = end == pos; hit });
+        }
+        if hit != negative { k(pos, caps) } else { false }
     }
 
     /* True when node consumes input[pos] as a single codepoint. */
     fn single_match(&self, node: &Node, pos: usize) -> bool {
         let c = self.input[pos];
         match node {
-            Node::Char(want) => self.ci_eq(c, *want),
-            Node::AnyChar => self.flags.dotall || c != '\n',
-            Node::Class { items, negated } => {
-                let hit = self.class_hit(items, c);
-                hit != *negated
-            }
+            Node::Char(want, f) => same(c, *want, *f),
+            Node::AnyChar(f) => f.dotall || c != '\n',
+            Node::Class { items, negated, flags } => class_hit(items, c, *flags) != *negated,
             _ => false,
         }
     }
 
-    /* Class membership, widening by case when ignorecase is set. */
-    fn class_hit(&self, items: &[ClassItem], c: char) -> bool {
-        if class_contains(items, c) { return true; }
-        if self.flags.ignorecase {
-            for alt in fold_variants(c) {
-                if alt != c && class_contains(items, alt) { return true; }
-            }
-        }
-        false
+    fn at_start(&self, pos: usize, multiline: bool) -> bool {
+        pos == 0 || (multiline && self.input[pos - 1] == '\n')
     }
 
-    fn ci_eq(&self, a: char, b: char) -> bool {
-        if a == b { return true; }
-        if self.flags.ignorecase { a.to_lowercase().eq(b.to_lowercase()) } else { false }
-    }
-
-    fn at_start(&self, pos: usize) -> bool {
-        pos == 0 || (self.flags.multiline && pos > 0 && self.input[pos - 1] == '\n')
-    }
-
-    fn at_end(&self, pos: usize) -> bool {
+    fn at_end(&self, pos: usize, multiline: bool) -> bool {
         let len = self.input.len();
         if pos == len { return true; }
         if pos == len - 1 && self.input[pos] == '\n' { return true; } // before a trailing newline
-        self.flags.multiline && self.input[pos] == '\n'
+        multiline && self.input[pos] == '\n'
     }
 
-    fn boundary(&self, pos: usize) -> bool {
-        let before = pos > 0 && is_word(self.input[pos - 1]);
-        let after = pos < self.input.len() && is_word(self.input[pos]);
+    fn boundary(&self, pos: usize, ascii: bool) -> bool {
+        let before = pos > 0 && is_word(self.input[pos - 1], ascii);
+        let after = pos < self.input.len() && is_word(self.input[pos], ascii);
         before != after
     }
 }
@@ -271,61 +263,69 @@ fn empty_caps(ngroups: usize) -> Caps {
 }
 
 fn is_single(node: &Node) -> bool {
-    matches!(node, Node::Char(_) | Node::AnyChar | Node::Class { .. })
+    matches!(node, Node::Char(..) | Node::AnyChar(_) | Node::Class { .. })
 }
 
-fn is_word(c: char) -> bool {
-    c.is_alphanumeric() || c == '_'
+// Equal, or equal once folded under ignorecase, where ascii folds ASCII letters alone.
+fn same(a: char, b: char, f: Flags) -> bool {
+    a == b || (f.ignorecase && if f.ascii { a.eq_ignore_ascii_case(&b) } else { a.to_lowercase().eq(b.to_lowercase()) })
+}
+
+fn is_word(c: char, ascii: bool) -> bool {
+    c == '_' || if ascii { c.is_ascii_alphanumeric() } else { c.is_alphanumeric() }
 }
 
 /* Predefined class predicates lean on std, so Unicode needs no tables. */
-fn item_match(item: &ClassItem, c: char) -> bool {
+fn item_match(item: &ClassItem, c: char, ascii: bool) -> bool {
+    let digit = if ascii { c.is_ascii_digit() } else { c.is_numeric() };
+    let space = if ascii { matches!(c, ' ' | '\t' | '\n' | '\r' | '\u{0B}' | '\u{0C}') } else { c.is_whitespace() };
     match item {
         ClassItem::Ch(x) => c == *x,
         ClassItem::Range(lo, hi) => *lo <= c && c <= *hi,
-        ClassItem::Digit => c.is_numeric(),
-        ClassItem::NotDigit => !c.is_numeric(),
-        ClassItem::Word => is_word(c),
-        ClassItem::NotWord => !is_word(c),
-        ClassItem::Space => c.is_whitespace(),
-        ClassItem::NotSpace => !c.is_whitespace(),
+        ClassItem::Digit => digit,
+        ClassItem::NotDigit => !digit,
+        ClassItem::Word => is_word(c, ascii),
+        ClassItem::NotWord => !is_word(c, ascii),
+        ClassItem::Space => space,
+        ClassItem::NotSpace => !space,
     }
 }
 
-fn class_contains(items: &[ClassItem], c: char) -> bool {
-    items.iter().any(|it| item_match(it, c))
+/* Class membership, widening by case when ignorecase is set. */
+fn class_hit(items: &[ClassItem], c: char, f: Flags) -> bool {
+    let contains = |c: char| items.iter().any(|it| item_match(it, c, f.ascii));
+    contains(c) || (f.ignorecase && fold_variants(c, f.ascii).into_iter().any(|alt| alt != c && contains(alt)))
 }
 
 /* Case variants to test for ignorecase class membership. */
-fn fold_variants(c: char) -> [char; 2] {
+fn fold_variants(c: char, ascii: bool) -> [char; 2] {
+    if ascii {
+        return [c.to_ascii_lowercase(), c.to_ascii_uppercase()];
+    }
     let lo = c.to_lowercase().next().unwrap_or(c);
     let up = c.to_uppercase().next().unwrap_or(c);
     [lo, up]
 }
 
-/* Fixed codepoint width of a node, None when it varies. */
-pub fn fixed_len(node: &Node) -> Option<usize> {
+/* Fixed codepoint width of a node, None when it varies, where a reference measures its group. */
+pub fn fixed_len(node: &Node, widths: &[Option<usize>]) -> Option<usize> {
     match node {
-        Node::Empty | Node::Start | Node::End | Node::WordBoundary | Node::NotWordBoundary => Some(0),
-        Node::Look { .. } => Some(0),
-        Node::Char(_) | Node::AnyChar | Node::Class { .. } => Some(1),
-        Node::Concat(v) => {
-            let mut total = 0;
-            for n in v { total += fixed_len(n)?; }
-            Some(total)
-        }
+        Node::Empty | Node::Start(_) | Node::End(_) | Node::StringStart | Node::StringEnd | Node::WordBoundary(_) | Node::NotWordBoundary(_) | Node::Look { .. } => Some(0),
+        Node::Char(..) | Node::AnyChar(_) | Node::Class { .. } => Some(1),
+        Node::Concat(v) => v.iter().try_fold(0, |total: usize, n| total.checked_add(fixed_len(n, widths)?)),
         Node::Alt(v) => {
-            let mut it = v.iter();
-            let first = fixed_len(it.next()?)?;
-            for n in it { if fixed_len(n)? != first { return None; } }
-            Some(first)
+            let first = fixed_len(v.first()?, widths)?;
+            v.iter().all(|n| fixed_len(n, widths) == Some(first)).then_some(first)
         }
-        Node::Group { node, .. } | Node::NonCap(node) => fixed_len(node),
+        Node::Group { node, .. } | Node::NonCap(node) | Node::Atomic(node) => fixed_len(node, widths),
         Node::Repeat { node, min, max, .. } => {
-            let m = (*max)?;
-            if m != *min { return None; }
-            Some(fixed_len(node)? * m)
+            if *max != Some(*min) { return None; }
+            fixed_len(node, widths)?.checked_mul(*min)
         }
-        Node::Backref(_) => None,
+        Node::Backref(n, _) => widths.get(*n).copied().flatten(),
+        Node::Cond { yes, no, .. } => {
+            let width = fixed_len(yes, widths)?;
+            (fixed_len(no, widths)? == width).then_some(width)
+        }
     }
 }
