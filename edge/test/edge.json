@@ -1,10 +1,10 @@
 {
   "name": "test",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Fixtures, assertions and a runner for Edge Python tests.",
   "repository": "https://github.com/dylan-sutton-chavez/edge-python-std",
   "docs": "./docs",
-  "edge": "0.7.3",
+  "edge": "0.7.5",
   "imports": {
     "test": "./main.py"
   }

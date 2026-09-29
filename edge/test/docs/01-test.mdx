@@ -57,7 +57,7 @@ pass. rejects negatives
 1 passed, 0 failed
 ```
 
-`run()` prints a `pass.`, `fail.` or `error.` line per test and a summary, then raises `SystemExit(1)` if anything failed and `SystemExit(0)` otherwise. A failed assertion carries its message.
+`run()` prints a `pass.`, `fail.` or `error.` line per test and a summary, then raises `SystemExit(1)` if anything failed and `SystemExit(0)` otherwise. A failed assertion carries its message. `edge test` drives what a file registered, so a test file needs no `run()` of its own.
 
 ```edge-python
 from test import test, run
