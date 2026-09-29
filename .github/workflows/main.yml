@@ -80,6 +80,8 @@ jobs:
     runs-on: ubuntu-26.04
     # A reviewer approves here, once every package has passed its tests.
     environment: production
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v7
 
@@ -112,3 +114,8 @@ jobs:
             edge publish app.edge || [ $? -eq 2 ]
             cd "$GITHUB_WORKSPACE"
           done
+
+      # The tag becomes a release once its packages are on the registry.
+      - uses: softprops/action-gh-release@v3
+        with:
+          generate_release_notes: true
