@@ -39,7 +39,7 @@ def specials():
 @test("floor, ceil and trunc give ints, and an int passes through")
 def rounding():
     assert (math.floor(2.7), math.ceil(2.1), math.trunc(-2.7), math.floor(-2.1), math.ceil(-0.5)) == (2, 3, -2, -3, 0)
-    assert math.floor(7) == 7 and math.ceil(True) == 1 and type(math.floor(2.5)) is int and math.floor(-1e20) == -100000000000000000000
+    assert math.floor(7) == 7 and math.ceil(True) == 1 and type(math.floor(2.5)) == int and math.floor(-1e20) == -100000000000000000000
     with raises(OverflowError, match="cannot convert float infinity to integer"):
         math.floor(math.inf)
     with raises(ValueError, match="cannot convert float NaN to integer"):
@@ -49,7 +49,7 @@ def rounding():
 def parts():
     assert math.modf(2.5) == (0.5, 2.0) and math.modf(-3.25) == (-0.25, -3.0) and math.modf(math.inf) == (0.0, math.inf)
     assert math.frexp(8) == (0.5, 4) and math.frexp(0.0) == (0.0, 0) and math.frexp(-3.0) == (-0.75, 2) and math.frexp(math.inf) == (math.inf, 0)
-    assert str(math.modf(-0.0)) == "(-0.0, -0.0)" and type(math.frexp(1.0)) is tuple
+    assert str(math.modf(-0.0)) == "(-0.0, -0.0)" and type(math.frexp(1.0)) == tuple
 
 @test("the integer functions stay exact")
 def integers():
@@ -90,7 +90,7 @@ def sums():
 
 @test("prod multiplies any values, so ints stay exact")
 def products():
-    assert math.prod([1, 2, 3, 4]) == 24 and type(math.prod([2, 3])) is int and math.prod([]) == 1 and math.prod([2.0, 0.5]) == 1.0
+    assert math.prod([1, 2, 3, 4]) == 24 and type(math.prod([2, 3])) == int and math.prod([]) == 1 and math.prod([2.0, 0.5]) == 1.0
     assert math.prod(range(1, 6), start=10) == 1200 and math.prod([2 ** 60, 2 ** 60]) == 2 ** 120
 
 @test("hypot and dist measure as Python does, to the last bit")

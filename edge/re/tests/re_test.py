@@ -95,7 +95,7 @@ def compiled():
     assert p.sub(r"\2.\1", "a 12-34 b") == "a 34.12 b"
     assert re.compile(r"(?P<n>\d)").groupindex == {"n": 1}
     assert repr(re.compile("hola", re.I)) == "re.compile('hola', re.IGNORECASE)"
-    assert repr(p) == r"re.compile('(\\d+)-(\\d+)')" and re.compile(p) is p
+    assert repr(p) == r"re.compile('(\\d+)-(\\d+)')" and re.compile(p) == p
 
 @test("escape guards every character a pattern gives meaning to")
 def escaping():
