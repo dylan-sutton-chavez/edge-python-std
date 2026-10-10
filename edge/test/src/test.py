@@ -43,19 +43,32 @@ def _build_kwargs(uses: tuple[str, ...]) -> dict:
         kwargs[name] = _fixtures[name]() # call fixture fresh per test
     return kwargs
 
+def _run_one(description: str, func, uses: tuple[str, ...]) -> bool:
+    try:
+        func(**_build_kwargs(uses))
+        print(f"pass. {description}")
+        return True
+    except AssertionError as e: # test failed
+        print(f"fail. {description} (AssertionError: {e})")
+    except SystemExit as e: # a test that exits ends only itself, never the run
+        print(f"error. {description} (SystemExit: {e})")
+    except Exception as e: # unexpected error in the test
+        print(f"error. {description} ({type(e).__name__}: {e})")
+    return False
+
+def _verdict(passed, failed, total: int) -> int:
+    # Only counts that add up to every test pass, so a broken counter or an empty run never reads as green.
+    if total == 0:
+        return 3
+    return 0 if failed == 0 and passed == total else 1
+
 def run() -> None:
     passed = 0
     failed = 0
     for description, func, uses in _tests:
-        try:
-            func(**_build_kwargs(uses))
-            print(f"pass. {description}")
+        if _run_one(description, func, uses):
             passed += 1
-        except AssertionError as e: # test failed
-            print(f"fail. {description} (AssertionError: {e})")
-            failed += 1
-        except Exception as e: # unexpected error in the test
-            print(f"error. {description} ({type(e).__name__}: {e})")
+        else:
             failed += 1
     print(f"{passed} passed, {failed} failed")
-    raise SystemExit(1 if failed else 0)
+    raise SystemExit(_verdict(passed, failed, len(_tests)))

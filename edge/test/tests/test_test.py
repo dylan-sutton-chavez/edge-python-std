@@ -49,4 +49,15 @@ def injected(items):
 def fresh(items):
     assert items == []
 
+@test("the verdict passes only a whole clean run, and a test that exits fails alone")
+def honest_verdict():
+    from test import _run_one, _verdict
+    assert _verdict(19, 0, 19) == 0 and _verdict(18, 1, 19) == 1
+    # Counters an engine fault left as None, or a test lost from the count, never read as green.
+    assert _verdict(None, None, 19) == 1 and _verdict(18, 0, 19) == 1
+    assert _verdict(0, 0, 0) == 3
+    def exits():
+        raise SystemExit(0)
+    assert _run_one("a test that exits", exits, ()) == False
+
 run()
