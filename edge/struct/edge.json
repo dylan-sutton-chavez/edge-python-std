@@ -8,6 +8,6 @@
   "imports": {
     "_struct": "./struct.wasm",
     "struct": "./main.py",
-    "test": "0.1.0"
+    "test": "0.1.2"
   }
 }

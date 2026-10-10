@@ -8,6 +8,6 @@
   "imports": {
     "_re": "./re.wasm",
     "re": "./main.py",
-    "test": "0.1.0"
+    "test": "0.1.2"
   }
 }
